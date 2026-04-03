@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "その他営業情報",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "分類": {
+        "type": "string",
+        "enum": ["その他"]
+      },
+      "件名": {
+        "type": "string",
+        "minLength": 1,
+        "description": "情報のタイトル"
+      },
+      "概要": {
+        "type": "string",
+        "description": "情報の概要"
+      }
+    }
+  }
+}

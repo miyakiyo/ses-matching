@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SES人材情報",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "分類": {
+        "type": "string",
+        "enum": ["人材"]
+      },
+      "名前": {
+        "type": "string",
+        "minLength": 1,
+        "description": "イニシャルまたは匿名化した氏名"
+      },
+      "性別": {
+        "type": "string",
+        "description": "例: 男性/女性/その他"
+      },
+      "年齢": {
+        "oneOf": [
+          {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 120
+          },
+            {
+              "type": "string",
+              "description": "数値以外の表現も許容（例: 20代後半）"
+            }
+        ],
+        "description": "整数または文字列表記"
+      },
+      "所属": {
+        "type": "string",
+        "description": "弊社所属 / １社下所属 など"
+      },
+      "外国籍": {
+        "type": "boolean",
+        "description": "true=外国籍 / false=日本国籍"
+      },
+      "個人事業主": {
+        "type": "boolean",
+        "description": "true=個人事業主 / false=法人所属"
+      },
+      "最寄駅": {
+        "type": "string",
+        "description": "主要路線や駅名"
+      },
+      "希望単価": {
+        "oneOf": [
+          {
+            "type": "number",
+            "minimum": 0,
+            "description": "例: 90 (単位=万円)"
+          },
+          {
+            "type": "string",
+            "pattern": "^[0-9]+(-[0-9]+)?万?円?$",
+            "description": "例: 80-100, 90万, 90万円"
+          }
+        ],
+        "description": "希望単価（数値または範囲）"
+      },
+      "稼働可能日": {
+        "type": "string",
+        "description": "稼働開始可能日（例: 即日/翌月/2025-10-01）"
+      },
+      "稼働率": {
+        "oneOf": [
+          {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "百分率（例: 80）"
+          },
+          {
+            "type": "string",
+            "pattern": "^[0-9]{1,3}(-[0-9]{1,3})?%?$",
+            "description": "範囲または表記例: 50-80% / 100%"
+          }
+        ],
+        "description": "稼働率"
+      },
+      "リモート頻度": {
+        "type": "string",
+        "description": "例: フルリモート/週2出社 など"
+      },
+      "担当": {
+        "type": "string",
+        "description": "想定ロール（例: メンバー/リーダー/SE/PG）"
+      },
+      "工程": {
+        "type": "string",
+        "description": "例: 要件定義/基本設計/詳細設計/開発/テスト/運用保守"
+      },
+      "開発言語": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "例: Java, Python, TypeScript"
+      },
+      "OS/クラウド": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "例: AWS, Azure, GCP など"
+      },
+      "データベース": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "例: MySQL, PostgreSQL, MongoDB など"
+      },
+      "スキル": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "その他技術/業務スキル"
+      },
+      "資格": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "保有資格（例: 基本情報技術者, Oracle, AWS など）"
+      },
+      "備考": {
+        "type": "string"
+      }
+    }
+  }
+}
