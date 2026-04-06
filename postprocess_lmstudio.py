@@ -59,6 +59,7 @@ def _call_lmstudio(
     prompt = (
         f"以下は{category}メール本文です。解析して必ずJSONのみを返してください。"
         "未記載の項目は必ず null または [] にする。\n"
+        "日本語で作成する。\n"
         "説明文やコードブロックは不要です。\n\n"
         f"本文:\n{body_text}"
     )
@@ -95,15 +96,28 @@ def process_pending_records_with_lmstudio(
     model: str,
     timeout: int = 60,
     limit_per_table: int = 500,
+    exclude_folders: list[str] | None = None,
 ) -> tuple[int, int]:
     """status='0' のレコードを LM Studio でJSON化して保存します。"""
     total_success = 0
     total_error = 0
+    normalized_excludes = [
+        str(folder_name).strip()
+        for folder_name in (exclude_folders or [])
+        if str(folder_name).strip()
+    ]
 
     for table_name in ("mails_human", "mails_case"):
-        records = get_pending_records(conn, table_name, limit=limit_per_table)
+        records = get_pending_records(
+            conn,
+            table_name,
+            limit=limit_per_table,
+            exclude_folders=normalized_excludes,
+        )
         category = "人材" if table_name == "mails_human" else "案件"
-        logger.info(f"LM後処理開始: table={table_name}, pending={len(records)}")
+        logger.info(
+            f"LM後処理開始: table={table_name}, pending={len(records)}, excluded_folders={normalized_excludes}"
+        )
 
         for record_id, body_text in records:
             try:

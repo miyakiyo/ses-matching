@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 NOT_FOLDER = config.get('mailbox', {}).get('not_folder', [])
 NOT_FOLDER_KEYWORDS = config.get('mailbox', {}).get('not_folder_keywords', [])
+LM_EXCLUDE_FOLDERS = config.get('mailbox', {}).get('lm_exclude_folders', [])
 
 def _parse_args() -> argparse.Namespace:
     """起動引数を解析します。"""
@@ -156,12 +157,14 @@ def _run_lm_postprocess(conn) -> None:
     lmstudio_model = config.get('lmstudio', {}).get('model', 'Qwen2.5-7B-Instruct-GGUF')
     lmstudio_timeout = int(config.get('lmstudio', {}).get('timeout', 60))
     lmstudio_limit = int(config.get('lmstudio', {}).get('limit_per_table', 500))
+    lm_exclude_folders = [str(name).strip() for name in LM_EXCLUDE_FOLDERS if str(name).strip()]
     lm_success, lm_error = process_pending_records_with_lmstudio(
         conn=conn,
         endpoint=lmstudio_endpoint,
         model=lmstudio_model,
         timeout=lmstudio_timeout,
         limit_per_table=lmstudio_limit,
+        exclude_folders=lm_exclude_folders,
     )
     logger.info(f'LM後処理結果: success={lm_success}, error={lm_error}')
 

@@ -245,16 +245,36 @@ def get_pending_records(
     conn: sqlite3.Connection,
     table_name: str,
     limit: int = 500,
+    exclude_folders: list[str] | None = None,
 ) -> list[tuple[int, str]]:
     """未処理レコード（status='0'）を取得します。
 
     :param conn: SQLiteコネクション。
     :param table_name: 対象テーブル名（mails_human または mails_case）。
     :param limit: 取得上限件数。
+    :param exclude_folders: 除外するフォルダ名一覧（完全一致・大文字小文字無視）。
     :return: (id, body) のタプル一覧。
     """
     if table_name not in ("mails_human", "mails_case"):
         raise ValueError(f"Unsupported table_name: {table_name}")
+
+    normalized_folders = [
+        str(folder_name).strip().casefold()
+        for folder_name in (exclude_folders or [])
+        if str(folder_name).strip()
+    ]
+
+    folder_exclude_sql = ""
+    params: list[object] = []
+
+    if normalized_folders:
+        placeholders = ", ".join(["?"] * len(normalized_folders))
+        folder_exclude_sql = (
+            f"\n          AND LOWER(TRIM(COALESCE(folder, ''))) NOT IN ({placeholders})"
+        )
+        params.extend(normalized_folders)
+
+    params.append(limit)
 
     rows = conn.execute(
         f"""
@@ -262,11 +282,11 @@ def get_pending_records(
         FROM {table_name}
         WHERE status = '0'
           AND body IS NOT NULL
-          AND body <> ''
+          AND body <> ''{folder_exclude_sql}
         ORDER BY id ASC
         LIMIT ?
         """,
-        (limit,),
+        tuple(params),
     ).fetchall()
     return [(int(row[0]), str(row[1])) for row in rows]
 

@@ -31,6 +31,7 @@ ENV/
 
 # SQLite database files
 *.db
+*.db-journal
 *.sqlite
 *.sqlite3
 *.db-shm
