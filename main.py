@@ -33,7 +33,39 @@ logger = logging.getLogger(__name__)
 
 NOT_FOLDER = config.get('mailbox', {}).get('not_folder', [])
 NOT_FOLDER_KEYWORDS = config.get('mailbox', {}).get('not_folder_keywords', [])
-LM_EXCLUDE_FOLDERS = config.get('mailbox', {}).get('lm_exclude_folders', [])
+LM_EXCLUDE_FOLDERS_HUMAN = config.get('mailbox', {}).get('lm_exclude_folders_human', [])
+LM_EXCLUDE_FOLDERS_CASE = config.get('mailbox', {}).get('lm_exclude_folders_case', [])
+
+PROCESS_DEFAULTS = {
+    'mail_fetch': True,
+    'lm_postprocess_human': True,
+    'lm_postprocess_case': True,
+    'matching': True,
+    'delete_old': True,
+    'csv_export': True,
+}
+
+
+def _coerce_process_flag(process_name: str, value, default: bool) -> bool:
+    """processes の値を bool に正規化します。"""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    logger.warning(
+        f'config.processes.{process_name} は bool を指定してください。default={default} を使用します。'
+    )
+    return default
+
+
+def _resolve_process_config() -> dict[str, bool]:
+    """config.yaml の processes 設定を解決します。"""
+    raw_processes = config.get('processes', {})
+    resolved: dict[str, bool] = {}
+    for process_name, default in PROCESS_DEFAULTS.items():
+        raw_value = raw_processes.get(process_name) if isinstance(raw_processes, dict) else None
+        resolved[process_name] = _coerce_process_flag(process_name, raw_value, default)
+    return resolved
 
 def _parse_args() -> argparse.Namespace:
     """起動引数を解析します。"""
@@ -65,7 +97,67 @@ def _resolve_mode(args: argparse.Namespace) -> str:
     if args.a:
         return 'all'
     # 引数なしは従来どおり全処理。
-    return 'all'
+    return 'config'
+
+
+def _resolve_process_plan(args: argparse.Namespace, process_config: dict[str, bool]) -> dict[str, bool]:
+    """CLI優先で実行プランを解決します。"""
+    if args.m:
+        return {
+            'mail_fetch': True,
+            'lm_postprocess_human': False,
+            'lm_postprocess_case': False,
+            'matching': False,
+            'delete_old': False,
+            'csv_export': False,
+        }
+    if args.l:
+        return {
+            'mail_fetch': False,
+            'lm_postprocess_human': True,
+            'lm_postprocess_case': True,
+            'matching': False,
+            'delete_old': False,
+            'csv_export': False,
+        }
+    if args.n:
+        return {
+            'mail_fetch': False,
+            'lm_postprocess_human': False,
+            'lm_postprocess_case': False,
+            'matching': True,
+            'delete_old': False,
+            'csv_export': False,
+        }
+    if args.d:
+        return {
+            'mail_fetch': False,
+            'lm_postprocess_human': False,
+            'lm_postprocess_case': False,
+            'matching': False,
+            'delete_old': True,
+            'csv_export': False,
+        }
+    if args.c:
+        return {
+            'mail_fetch': False,
+            'lm_postprocess_human': False,
+            'lm_postprocess_case': False,
+            'matching': False,
+            'delete_old': False,
+            'csv_export': True,
+        }
+    if args.a:
+        return {
+            'mail_fetch': True,
+            'lm_postprocess_human': True,
+            'lm_postprocess_case': True,
+            'matching': True,
+            'delete_old': True,
+            'csv_export': True,
+        }
+    # CLI未指定時のみconfigを採用する。
+    return process_config
 
 
 def _acquire_access_token() -> str:
@@ -151,20 +243,34 @@ def _run_mail_fetch(conn, access_token: str) -> datetime:
     return end
 
 
-def _run_lm_postprocess(conn) -> None:
+def _run_lm_postprocess(conn, run_human: bool = True, run_case: bool = True) -> None:
     """LM後処理を実行します。"""
+    if not run_human and not run_case:
+        logger.info('LM後処理は設定によりスキップされました。')
+        return
+
     lmstudio_endpoint = config.get('lmstudio', {}).get('endpoint', 'http://localhost:1234/v1/chat/completions')
     lmstudio_model = config.get('lmstudio', {}).get('model', 'Qwen2.5-7B-Instruct-GGUF')
     lmstudio_timeout = int(config.get('lmstudio', {}).get('timeout', 60))
     lmstudio_limit = int(config.get('lmstudio', {}).get('limit_per_table', 500))
-    lm_exclude_folders = [str(name).strip() for name in LM_EXCLUDE_FOLDERS if str(name).strip()]
+    lm_exclude_folders_human = [str(name).strip() for name in LM_EXCLUDE_FOLDERS_HUMAN if str(name).strip()]
+    lm_exclude_folders_case = [str(name).strip() for name in LM_EXCLUDE_FOLDERS_CASE if str(name).strip()]
+    enabled_tables = []
+    if run_human:
+        enabled_tables.append('mails_human')
+    if run_case:
+        enabled_tables.append('mails_case')
+
     lm_success, lm_error = process_pending_records_with_lmstudio(
         conn=conn,
         endpoint=lmstudio_endpoint,
         model=lmstudio_model,
         timeout=lmstudio_timeout,
         limit_per_table=lmstudio_limit,
-        exclude_folders=lm_exclude_folders,
+        exclude_folders_human=lm_exclude_folders_human,
+        exclude_folders_case=lm_exclude_folders_case,
+        enabled_tables=enabled_tables,
+        run_matching=False,
     )
     logger.info(f'LM後処理結果: success={lm_success}, error={lm_error}')
 
@@ -202,33 +308,49 @@ def _run_matching_only(conn) -> None:
 if __name__ == '__main__':
     args = _parse_args()
     mode = _resolve_mode(args)
+    process_config = _resolve_process_config()
+    process_plan = _resolve_process_plan(args, process_config)
 
     db_path = config.get('mailbox', {}).get('db_path', 'mails.db')
     conn = init_db(db_path)
 
     try:
         logger.info(f'実行モード: {mode}')
+        logger.info(f'実行プラン: {process_plan}')
+        end = None
 
-        if mode in ('mail', 'all'):
+        if process_plan['mail_fetch']:
             access_token = _acquire_access_token()
             end = _run_mail_fetch(conn, access_token)
-            if mode == 'mail':
-                record_run_at(conn, end)
+        else:
+            logger.info('メール取得は設定によりスキップされました。')
 
-        if mode in ('lm', 'all'):
-            _run_lm_postprocess(conn)
+        if process_plan['lm_postprocess_human'] or process_plan['lm_postprocess_case']:
+            _run_lm_postprocess(
+                conn,
+                run_human=process_plan['lm_postprocess_human'],
+                run_case=process_plan['lm_postprocess_case'],
+            )
+        else:
+            logger.info('LM後処理は設定によりスキップされました。')
 
-        if mode == 'matching':
+        if process_plan['matching']:
             _run_matching_only(conn)
+        else:
+            logger.info('マッチング処理は設定によりスキップされました。')
 
-        if mode == 'all':
+        if end is not None:
             record_run_at(conn, end)
 
-        if mode in ('delete', 'all'):
+        if process_plan['delete_old']:
             _run_delete_old_records(conn)
+        else:
+            logger.info('古いレコード削除は設定によりスキップされました。')
 
-        if mode in ('csv', 'all'):
+        if process_plan['csv_export']:
             _run_csv_export(conn)
+        else:
+            logger.info('CSV出力は設定によりスキップされました。')
 
     except Exception as e:
         logger.error(f'エラー: {e}')

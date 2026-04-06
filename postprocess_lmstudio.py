@@ -96,27 +96,45 @@ def process_pending_records_with_lmstudio(
     model: str,
     timeout: int = 60,
     limit_per_table: int = 500,
-    exclude_folders: list[str] | None = None,
+    exclude_folders_human: list[str] | None = None,
+    exclude_folders_case: list[str] | None = None,
+    enabled_tables: list[str] | None = None,
+    run_matching: bool = True,
 ) -> tuple[int, int]:
     """status='0' のレコードを LM Studio でJSON化して保存します。"""
     total_success = 0
     total_error = 0
-    normalized_excludes = [
+    enabled_tables_set = set(enabled_tables) if enabled_tables else {"mails_human", "mails_case"}
+    normalized_excludes_human = [
         str(folder_name).strip()
-        for folder_name in (exclude_folders or [])
+        for folder_name in (exclude_folders_human or [])
+        if str(folder_name).strip()
+    ]
+    normalized_excludes_case = [
+        str(folder_name).strip()
+        for folder_name in (exclude_folders_case or [])
         if str(folder_name).strip()
     ]
 
     for table_name in ("mails_human", "mails_case"):
+        if table_name not in enabled_tables_set:
+            logger.info(f"LM後処理スキップ: table={table_name}")
+            continue
+
+        current_excludes = (
+            normalized_excludes_human
+            if table_name == "mails_human"
+            else normalized_excludes_case
+        )
         records = get_pending_records(
             conn,
             table_name,
             limit=limit_per_table,
-            exclude_folders=normalized_excludes,
+            exclude_folders=current_excludes,
         )
         category = "人材" if table_name == "mails_human" else "案件"
         logger.info(
-            f"LM後処理開始: table={table_name}, pending={len(records)}, excluded_folders={normalized_excludes}"
+            f"LM後処理開始: table={table_name}, pending={len(records)}, excluded_folders={current_excludes}"
         )
 
         for record_id, body_text in records:
@@ -154,16 +172,16 @@ def process_pending_records_with_lmstudio(
         conn.commit()
 
     logger.info(f"LM後処理完了: success={total_success}, error={total_error}")
-    
-    # LM処理完了後、マッチング処理を実行
-    logger.info("マッチング処理開始...")
-    try:
-        match_stats = process_all_matches(conn)
-        logger.info(
-            f"マッチング処理完了: total={match_stats['total_matches']}, "
-            f"added={match_stats['added']}, updated={match_stats['updated']}"
-        )
-    except Exception as e:
-        logger.error(f"マッチング処理失敗: {e}")
+
+    if run_matching:
+        logger.info("マッチング処理開始...")
+        try:
+            match_stats = process_all_matches(conn)
+            logger.info(
+                f"マッチング処理完了: total={match_stats['total_matches']}, "
+                f"added={match_stats['added']}, updated={match_stats['updated']}"
+            )
+        except Exception as e:
+            logger.error(f"マッチング処理失敗: {e}")
     
     return total_success, total_error
