@@ -4,14 +4,15 @@ import argparse
 import os
 import yaml
 import logging
+from pathlib import Path
 
-from database_utils import init_db, get_last_run_at, record_run_at, delete_old_records, export_tables_to_csv
-from classifier_utils import classify_ses_subject, append_unclassified_log
-from graph_mail import get_mail_subjects, list_mail_folders
-from postprocess_lmstudio import process_pending_records_with_lmstudio
+from src.database_utils import init_db, get_last_run_at, record_run_at, delete_old_records, export_tables_to_csv
+from src.classifier_utils import classify_ses_subject, append_unclassified_log
+from src.graph_mail import get_mail_subjects, list_mail_folders
+from src.postprocess_lmstudio import process_pending_records_with_lmstudio
 
 # config.yaml ファイルから設定を読み込む（YAML形式）
-env_file = 'config.yaml'
+env_file = 'config/config.yaml'
 # 設定ファイルが無い場合は起動不可なので即時終了する。
 if not os.path.exists(env_file):
     raise FileNotFoundError(f'{env_file} ファイルが見つかりません。{env_file} を作成してください。')
@@ -20,7 +21,11 @@ with open(env_file, 'r', encoding='utf-8') as f:
     config = yaml.safe_load(f) or {}
 
 # ロギング初期化
-log_path = config.get('ses', {}).get('log_path', 'app.log')
+log_path = config.get('ses', {}).get('log_path', 'logs/app.log')
+# ログディレクトリを自動作成
+log_dir = Path(log_path).parent
+log_dir.mkdir(parents=True, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -232,7 +237,7 @@ def _run_mail_fetch(conn, access_token: str) -> datetime:
         not_folder_keywords=NOT_FOLDER_KEYWORDS,
     )
 
-    unclassified_log_path = config.get('ses', {}).get('unclassified_log_path', 'unclassified.log')
+    unclassified_log_path = config.get('ses', {}).get('unclassified_log_path', 'logs/unclassified.log')
     logger.info(f'件数: {len(titles)}')
     for folder, subject in titles[:1000]:
         category = classify_ses_subject(subject, project_keywords, talent_keywords)
@@ -253,6 +258,7 @@ def _run_lm_postprocess(conn, run_human: bool = True, run_case: bool = True) -> 
     lmstudio_model = config.get('lmstudio', {}).get('model', 'Qwen2.5-7B-Instruct-GGUF')
     lmstudio_timeout = int(config.get('lmstudio', {}).get('timeout', 60))
     lmstudio_limit = int(config.get('lmstudio', {}).get('limit_per_table', 500))
+    lmstudio_num_workers = max(1, int(config.get('lmstudio', {}).get('num_workers', 4)))
     lm_exclude_folders_human = [str(name).strip() for name in LM_EXCLUDE_FOLDERS_HUMAN if str(name).strip()]
     lm_exclude_folders_case = [str(name).strip() for name in LM_EXCLUDE_FOLDERS_CASE if str(name).strip()]
     enabled_tables = []
@@ -271,6 +277,7 @@ def _run_lm_postprocess(conn, run_human: bool = True, run_case: bool = True) -> 
         exclude_folders_case=lm_exclude_folders_case,
         enabled_tables=enabled_tables,
         run_matching=False,
+        max_workers=lmstudio_num_workers,
     )
     logger.info(f'LM後処理結果: success={lm_success}, error={lm_error}')
 
@@ -291,7 +298,7 @@ def _run_csv_export(conn) -> None:
 
 def _run_matching_only(conn) -> None:
     """マッチング処理のみを実行します。"""
-    from matching_engine import process_all_matches
+    from src.matching_engine import process_all_matches
     
     logger.info('マッチング処理開始...')
     try:
@@ -311,7 +318,7 @@ if __name__ == '__main__':
     process_config = _resolve_process_config()
     process_plan = _resolve_process_plan(args, process_config)
 
-    db_path = config.get('mailbox', {}).get('db_path', 'mails.db')
+    db_path = config.get('mailbox', {}).get('db_path', 'DB/mails.db')
     conn = init_db(db_path)
 
     try:

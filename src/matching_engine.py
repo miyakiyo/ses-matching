@@ -1,7 +1,7 @@
 import json
 import sqlite3
 from typing import Optional, Tuple
-from database_utils import (
+from .database_utils import (
     get_human_record,
     get_case_record,
     add_match,
