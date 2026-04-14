@@ -1,13 +1,14 @@
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
 import requests
 import sqlite3
 
-from database_utils import get_pending_records, update_record_json_status_and_properties
-from matching_engine import process_all_matches
+from .database_utils import get_pending_records, update_record_json_status_and_properties
+from .matching_engine import process_all_matches
 
 
 logger = logging.getLogger(__name__)
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 def _load_case_schema_text() -> str:
     """案件JSONスキーマ文字列を読み込みます。"""
-    schema_path = Path(__file__).with_name("案件フォーマット.json")
+    schema_path = Path(__file__).parent.parent / "config" / "案件フォーマット.json"
     if not schema_path.exists():
         raise FileNotFoundError(f"案件スキーマが見つかりません: {schema_path}")
     return schema_path.read_text(encoding="utf-8")
@@ -23,7 +24,7 @@ def _load_case_schema_text() -> str:
 
 def _load_human_schema_text() -> str:
     """人材JSONスキーマ文字列を読み込みます。"""
-    schema_path = Path(__file__).with_name("人材フォーマット.json")
+    schema_path = Path(__file__).parent.parent / "config" / "人材フォーマット.json"
     if not schema_path.exists():
         raise FileNotFoundError(f"人材スキーマが見つかりません: {schema_path}")
     return schema_path.read_text(encoding="utf-8")
@@ -86,8 +87,42 @@ def _call_lmstudio(
         raise RuntimeError("LM Studio response content is empty")
 
     # モデル応答がJSON文字列として妥当かを検証する。
-    parsed = json.loads(content)
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parse failed: content={content}, error={e}")
+        return json.dumps({}, ensure_ascii=False)
     return json.dumps(parsed, ensure_ascii=False)
+
+
+def _process_single_record_for_lm(
+    endpoint: str,
+    model: str,
+    body_text: str,
+    category: str,
+    timeout: int,
+) -> tuple[str, dict[str, Any]]:
+    """単一レコードのLM問い合わせ結果を返す（DB更新は行わない）。"""
+    json_text = _call_lmstudio(
+        endpoint=endpoint,
+        model=model,
+        body_text=body_text,
+        category=category,
+        timeout=timeout,
+    )
+
+    parsed = json.loads(json_text)
+    if isinstance(parsed, list):
+        first_obj = parsed[0] if parsed else {}
+    elif isinstance(parsed, dict):
+        first_obj = parsed
+    else:
+        first_obj = {}
+
+    if not isinstance(first_obj, dict):
+        first_obj = {}
+
+    return json_text, first_obj
 
 
 def process_pending_records_with_lmstudio(
@@ -100,10 +135,12 @@ def process_pending_records_with_lmstudio(
     exclude_folders_case: list[str] | None = None,
     enabled_tables: list[str] | None = None,
     run_matching: bool = True,
+    max_workers: int = 4,
 ) -> tuple[int, int]:
     """status='0' のレコードを LM Studio でJSON化して保存します。"""
     total_success = 0
     total_error = 0
+    normalized_workers = max(1, int(max_workers))
     enabled_tables_set = set(enabled_tables) if enabled_tables else {"mails_human", "mails_case"}
     normalized_excludes_human = [
         str(folder_name).strip()
@@ -134,40 +171,40 @@ def process_pending_records_with_lmstudio(
         )
         category = "人材" if table_name == "mails_human" else "案件"
         logger.info(
-            f"LM後処理開始: table={table_name}, pending={len(records)}, excluded_folders={current_excludes}"
+            f"LM後処理開始: table={table_name}, pending={len(records)}, excluded_folders={current_excludes}, workers={normalized_workers}"
         )
 
-        for record_id, body_text in records:
-            try:
-                json_text = _call_lmstudio(
-                    endpoint=endpoint,
-                    model=model,
-                    body_text=body_text,
-                    category=category,
-                    timeout=timeout,
+        futures: dict[Any, int] = {}
+        with ThreadPoolExecutor(max_workers=normalized_workers) as executor:
+            for record_id, body_text in records:
+                future = executor.submit(
+                    _process_single_record_for_lm,
+                    endpoint,
+                    model,
+                    body_text,
+                    category,
+                    timeout,
                 )
-                parsed = json.loads(json_text)
-                if isinstance(parsed, list):
-                    first_obj = parsed[0] if parsed else {}
-                elif isinstance(parsed, dict):
-                    first_obj = parsed
-                else:
-                    first_obj = {}
+                futures[future] = record_id
 
-                update_record_json_status_and_properties(
-                    conn=conn,
-                    table_name=table_name,
-                    record_id=record_id,
-                    json_data=json_text,
-                    properties=first_obj,
-                    status="1",
-                )
-                total_success += 1
-            except Exception as e:
-                total_error += 1
-                logger.error(
-                    f"LM後処理失敗: table={table_name}, id={record_id}, error={e}"
-                )
+            for future in as_completed(futures):
+                record_id = futures[future]
+                try:
+                    json_text, first_obj = future.result()
+                    update_record_json_status_and_properties(
+                        conn=conn,
+                        table_name=table_name,
+                        record_id=record_id,
+                        json_data=json_text,
+                        properties=first_obj,
+                        status="1",
+                    )
+                    total_success += 1
+                except Exception as e:
+                    total_error += 1
+                    logger.error(
+                        f"LM後処理失敗: table={table_name}, id={record_id}, error={e}"
+                    )
 
         conn.commit()
 

@@ -13,10 +13,10 @@ import argparse
 from datetime import datetime, timezone, timedelta
 from msal import ConfidentialClientApplication
 
-from graph_mail import delete_mails_before_date
+from .graph_mail import delete_mails_before_date
 
 # config.yaml ファイルから設定を読み込む
-config_file = 'config.yaml'
+config_file = 'config/config.yaml'
 if not os.path.exists(config_file):
     raise FileNotFoundError(f'{config_file} ファイルが見つかりません。')
 
@@ -24,7 +24,7 @@ with open(config_file, 'r', encoding='utf-8') as f:
     config = yaml.safe_load(f) or {}
 
 # ロギング初期化
-log_path = config.get('ses', {}).get('log_path', 'app.log')
+log_path = config.get('ses', {}).get('log_path', 'logs/app.log')
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',

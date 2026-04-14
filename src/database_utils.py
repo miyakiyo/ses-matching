@@ -6,7 +6,7 @@ import json
 import sqlite3
 
 
-def init_db(db_path: str = "mails.db") -> sqlite3.Connection:
+def init_db(db_path: str = "DB/mails.db") -> sqlite3.Connection:
     """アプリで利用するSQLiteテーブルを初期化します。
 
     :param db_path: SQLiteデータベースファイルのパス。

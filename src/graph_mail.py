@@ -5,7 +5,7 @@ import json
 import sqlite3
 import requests
 
-from classifier_utils import classify_ses_subject, should_skip_folder
+from .classifier_utils import classify_ses_subject, should_skip_folder
 
 
 logger = logging.getLogger(__name__)

@@ -1,5 +1,6 @@
 import logging
 from typing import List
+from pathlib import Path
 
 
 def classify_ses_subject(subject: str, project_keywords: List[str], talent_keywords: List[str]) -> str:
@@ -31,6 +32,10 @@ def append_unclassified_log(log_path: str, folder: str, subject: str) -> None:
     :param subject: メール件名。
     :return: なし。
     """
+    # ログディレクトリを自動作成
+    log_dir = Path(log_path).parent
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
     logger_name = f"unclassified.{log_path}"
     logger = logging.getLogger(logger_name)
     logger.setLevel(logging.INFO)
