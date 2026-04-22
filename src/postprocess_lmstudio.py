@@ -889,6 +889,48 @@ def _sanitize_json_like_content(content: str) -> str:
         normalized,
     )
 
+    # 3) 例: "会社, "_extra_item_1": ": "大手..." -> "会社": "大手..."
+    normalized = re.sub(
+        r'"([^"\\,:]{1,120})\s*,\s*"_extra_item_\d+"\s*:\s*":\s*"([^"\\]*)"',
+        r'"\1": "\2"',
+        normalized,
+    )
+
+    # 3.1) 例: "期間": "[直近], "会社, "_extra_item_1": ": "大手..." -> "期間": "[直近]", "会社": "大手..."
+    normalized = re.sub(
+        r'("(?:[^"\\]|\\.)+"\s*:\s*)"([^"\\]*?)\s*,\s*"([^"\\,:]{1,120})\s*,\s*"_extra_item_\d+"\s*:\s*":\s*"([^"\\]*)"',
+        r'\1"\2", "\3": "\4"',
+        normalized,
+    )
+
+    # 4) 例: "役職"_extra_item_3": ": "PL" -> "役職": "PL"
+    normalized = re.sub(
+        r'"([^"\\,:]{1,120})"_extra_item_\d+"\s*:\s*":\s*"([^"\\]*)"',
+        r'"\1": "\2"',
+        normalized,
+    )
+
+    # 4.1) 例: "役職"_extra_item_14": ": ["情報企画部..."_extra_item_15": "] -> "役職": ["情報企画部..."]
+    normalized = re.sub(
+        r'"([^"\\,:]{1,120})"_extra_item_\d+"\s*:\s*":\s*\[\s*"([^"\\]*)"_extra_item_\d+"\s*:\s*"\]\s*(?=[,}\]])',
+        r'"\1": ["\2"]',
+        normalized,
+    )
+
+    # 5) 例: "要件..."_extra_item_8": ", "SAP..." -> "要件...", "SAP..."
+    normalized = re.sub(
+        r'"([^"\\]+)"_extra_item_\d+"\s*:\s*",\s*"([^"\\]+)"',
+        r'"\1", "\2"',
+        normalized,
+    )
+
+    # 6) 例: "LINE": "https://... , "_extra_item_52": " } -> "LINE": "https://..." }
+    normalized = re.sub(
+        r'(:\s*"https?://[^"\\]+),\s*"_extra_item_\d+"\s*:\s*"\s*([}\]])',
+        r'\1"\2',
+        normalized,
+    )
+
     # 例: {"Max": 800000, "140 ~ 180時間"} のようなキーなし文字列要素を補正
     normalized = _fix_orphan_strings_in_objects(normalized)
 
@@ -1005,6 +1047,14 @@ def _call_lmstudio(
         "未記載は null または []。\n\n"
         f"本文:\n{ultra_safe_body_text[:300]}"
     )
+    # 一部のサーバー実装で本文先頭が JSON 断片だと parse input 400 を返すことがあるため、
+    # 最終手段として波括弧を中立化した本文も用意する。
+    ultra_safe_neutralized_body_text = ultra_safe_body_text.replace("{", "（").replace("}", "）")
+    compact_prompt_300_neutralized = (
+        f"{category}メール本文から項目を抽出し、JSONのみ返してください。\n"
+        "未記載は null または []。\n\n"
+        f"本文:\n{ultra_safe_neutralized_body_text[:300]}"
+    )
 
     request_variants: list[tuple[str, str]] = []
 
@@ -1025,6 +1075,7 @@ def _call_lmstudio(
     request_variants.append((compact_system_content, compact_prompt_1200))
     request_variants.append((compact_system_content, compact_prompt_600))
     request_variants.append((compact_system_content, compact_prompt_300_safe))
+    request_variants.append((compact_system_content, compact_prompt_300_neutralized))
 
     resp: requests.Response | None = None
     last_http_error: requests.HTTPError | None = None
@@ -1044,27 +1095,34 @@ def _call_lmstudio(
         if resp.ok:
             break
 
-        logger.error(
-            "LM Studio API error: status=%s, body=%s",
-            resp.status_code,
-            resp.text,
+        is_retryable_400 = (
+            resp.status_code == 400
+            and (
+                "Failed to parse input" in resp.text
+                or "n_keep" in resp.text
+                or "context length" in resp.text
+                or "Context size" in resp.text
+            )
         )
+        can_retry_with_shorter_prompt = i < len(request_variants) - 1
+
+        if is_retryable_400 and can_retry_with_shorter_prompt:
+            logger.warning(
+                "LM Studio API retryable error: status=%s, body=%s",
+                resp.status_code,
+                resp.text,
+            )
+        else:
+            logger.error(
+                "LM Studio API error: status=%s, body=%s",
+                resp.status_code,
+                resp.text,
+            )
 
         try:
             resp.raise_for_status()
         except requests.HTTPError as e:
             last_http_error = e
-            is_retryable_400 = (
-                resp is not None
-                and resp.status_code == 400
-                and (
-                    "Failed to parse input" in resp.text
-                    or "n_keep" in resp.text
-                    or "context length" in resp.text
-                    or "Context size" in resp.text
-                )
-            )
-            can_retry_with_shorter_prompt = i < len(request_variants) - 1
             if is_retryable_400 and can_retry_with_shorter_prompt:
                 logger.warning(
                     "LM Studio request retry with fallback payload: category=%s, chars=%s -> %s",
@@ -1099,12 +1157,17 @@ def _call_lmstudio(
             parsed = json.loads(repaired)
             logger.warning("JSON parse repaired by sanitizer")
         except json.JSONDecodeError as repaired_error:
-            logger.error(
-                "JSON parse failed (sanitized): content=%s, error=%s",
+            logger.warning(
+                "JSON parse failed (sanitized), applying fallback: content=%s, error=%s",
                 repaired,
                 repaired_error,
             )
-            raise RuntimeError("LM Studio returned invalid JSON") from repaired_error
+            parsed = {
+                "raw_content": content,
+                "sanitized_content": repaired,
+                "sanitize_error": "fallback_applied_callsite",
+            }
+            logger.warning("JSON parse fallback applied at call-site")
     return json.dumps(parsed, ensure_ascii=False)
 
 
