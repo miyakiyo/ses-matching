@@ -1,18 +1,38 @@
 # ses-matching
 SESのマッチングに利用
 
-## 実行フラグ設定
+## 実行方法
 
-`config.yaml` の `processes` で処理ごとの実行可否を設定できます。
+```powershell
+python main.py [オプション]
+```
 
-- `mail_fetch`: メール取得
-- `lm_postprocess_human`: LLM処理（人材）
-- `lm_postprocess_case`: LLM処理（案件）
-- `matching`: マッチング
-- `delete_old`: 古いレコード削除
-- `csv_export`: CSV出力
+## CLIパラメーター
 
-優先順位は `CLI引数 > config.yaml(processes) > デフォルト値(true)` です。
+互いに排他的なオプションです（同時に1つのみ指定可）。
 
-- CLI未指定時: `processes` の設定に従って実行
-- CLI指定時: 指定した処理のみ実行（`-l` はLM処理のみ、`matching` は実行しない）
+| オプション | 実行される処理 |
+|---|---|
+| `-m` | メール取得のみ |
+| `-l` | LM後処理のみ（人材・案件） |
+| `-n` | マッチング処理のみ |
+| `-d` | 古いレコード削除のみ |
+| `-c` | CSV出力のみ |
+| `-a` | 全処理を実行 |
+| （省略） | `config.yaml` の `processes` 設定に従って実行 |
+
+## config.yaml の processes 設定
+
+CLIオプション未指定時に、処理ごとの実行可否を設定できます。
+
+```yaml
+processes:
+  mail_fetch: true           # メール取得
+  lm_postprocess_human: true # LLM処理（人材）
+  lm_postprocess_case: true  # LLM処理（案件）
+  matching: true             # マッチング
+  delete_old: true           # 古いレコード削除
+  csv_export: true           # CSV出力
+```
+
+優先順位: `CLIオプション > config.yaml(processes) > デフォルト値(true)`

@@ -257,6 +257,7 @@ def _run_lm_postprocess(conn, run_human: bool = True, run_case: bool = True) -> 
     lmstudio_endpoint = config.get('lmstudio', {}).get('endpoint', 'http://localhost:1234/v1/chat/completions')
     lmstudio_model = config.get('lmstudio', {}).get('model', 'Qwen2.5-7B-Instruct-GGUF')
     lmstudio_timeout = int(config.get('lmstudio', {}).get('timeout', 60))
+    lmstudio_max_tokens = max(1, int(config.get('lmstudio', {}).get('max_tokens', 512)))
     lmstudio_limit = int(config.get('lmstudio', {}).get('limit_per_table', 500))
     lmstudio_num_workers = max(1, int(config.get('lmstudio', {}).get('num_workers', 4)))
     lm_exclude_folders_human = [str(name).strip() for name in LM_EXCLUDE_FOLDERS_HUMAN if str(name).strip()]
@@ -272,6 +273,7 @@ def _run_lm_postprocess(conn, run_human: bool = True, run_case: bool = True) -> 
         endpoint=lmstudio_endpoint,
         model=lmstudio_model,
         timeout=lmstudio_timeout,
+        max_tokens=lmstudio_max_tokens,
         limit_per_table=lmstudio_limit,
         exclude_folders_human=lm_exclude_folders_human,
         exclude_folders_case=lm_exclude_folders_case,
