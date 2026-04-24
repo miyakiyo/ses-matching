@@ -336,6 +336,7 @@ def delete_mails_before_date(
     include_subfolders: bool = True,
     not_folder: List[str] = None,
     not_folder_keywords: List[str] = None,
+    token_refresher: Callable[[], str] = None,
 ) -> tuple:
     """指定日時より前のメールをメールボックスから削除します。
 
@@ -345,6 +346,7 @@ def delete_mails_before_date(
     :param include_subfolders: 子フォルダも再帰的に検索するか。
     :param not_folder: 除外フォルダ名一覧（完全一致）。
     :param not_folder_keywords: 除外キーワード一覧（完全一致）。
+    :param token_refresher: 期限切れ時のアクセストークン再取得関数。
     :return: (削除したメール数, エラー数) のタプル。
     """
     # access_tokenがない場合は処理を続行できないため、明示的に例外を投げる。
@@ -356,6 +358,40 @@ def delete_mails_before_date(
         "Authorization": f"Bearer {access_token}",
         "Prefer": 'outlook.timezone="Tokyo Standard Time"',
     }
+
+    def _is_expired_token_response(resp: requests.Response) -> bool:
+        if resp.status_code != 401:
+            return False
+        body = resp.text or ""
+        return "InvalidAuthenticationToken" in body and (
+            "token is expired" in body.lower() or "lifetime validation failed" in body.lower()
+        )
+
+    def _refresh_access_token() -> None:
+        nonlocal access_token, headers
+        if token_refresher is None:
+            raise RuntimeError("アクセストークンの有効期限が切れました。再取得関数が設定されていません。")
+        new_token = token_refresher()
+        if not new_token:
+            raise RuntimeError("アクセストークン再取得に失敗しました。")
+        access_token = new_token
+        headers["Authorization"] = f"Bearer {new_token}"
+        logger.info("Graph API access token refreshed during deletion")
+
+    def _graph_get(url: str) -> requests.Response:
+        resp = requests.get(url, headers=headers)
+        if _is_expired_token_response(resp):
+            _refresh_access_token()
+            resp = requests.get(url, headers=headers)
+        return resp
+
+    def _graph_delete(url: str) -> requests.Response:
+        resp = requests.delete(url, headers=headers)
+        if _is_expired_token_response(resp):
+            _refresh_access_token()
+            resp = requests.delete(url, headers=headers)
+        return resp
+
     not_folder = not_folder or []
     not_folder_keywords = not_folder_keywords or []
 
@@ -383,7 +419,7 @@ def delete_mails_before_date(
         page_num = 0
         while url:
             page_num += 1
-            resp = requests.get(url, headers=headers)
+            resp = _graph_get(url)
             logger.debug(f"Fetch page {page_num}: {resp.status_code}")
             # APIエラー時はループを抜ける。
             if resp.status_code != 200:
@@ -400,7 +436,7 @@ def delete_mails_before_date(
                 msg_subject = item.get("subject", "(no subject)")
                 try:
                     delete_url = f"https://graph.microsoft.com/v1.0/users/{user_email}/messages/{msg_id}"
-                    del_resp = requests.delete(delete_url, headers=headers)
+                    del_resp = _graph_delete(delete_url)
                     if del_resp.status_code in [200, 204]:
                         deleted_count += 1
                         logger.debug(f"Deleted: {msg_subject}")
@@ -425,7 +461,7 @@ def delete_mails_before_date(
         else:
             folder_url = f"https://graph.microsoft.com/v1.0/users/{user_email}/mailFolders/{folder_path}"
 
-        response = requests.get(folder_url, headers=headers)
+        response = _graph_get(folder_url)
         # APIエラー時は処理を中断する。
         if response.status_code != 200:
             logger.error(f"Failed to get folder info: status={response.status_code} detail={response.text}")
@@ -441,7 +477,7 @@ def delete_mails_before_date(
 
         if include_subfolders:
             child_url = f"https://graph.microsoft.com/v1.0/users/{user_email}/mailFolders/{folder_id}/childFolders"
-            child_resp = requests.get(child_url, headers=headers)
+            child_resp = _graph_get(child_url)
             if child_resp.status_code != 200:
                 logger.debug(f"Failed to list child folders: {child_resp.status_code}")
                 return
@@ -460,7 +496,7 @@ def delete_mails_before_date(
                     recurse_delete_folder(cid)
 
     # トップレベルのフォルダ一覧を取得してから、各フォルダから削除を実行する。
-    for folder_name, folder_id in list_mail_folders(user_email, access_token):
+    for folder_name, folder_id in list_mail_folders(user_email, access_token, token_refresher=token_refresher):
         try:
             # トップレベルフォルダも除外ルールを適用する。
             if should_skip_folder(folder_name, not_folder, not_folder_keywords):

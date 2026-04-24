@@ -72,12 +72,17 @@ def main():
         # Graph API トークン取得
         logger.info('Graph API トークンを取得しています...')
         app = ConfidentialClientApplication(CLIENT_ID, authority=AUTHORITY, client_credential=CLIENT_SECRET)
-        token_response = app.acquire_token_for_client(scopes=SCOPE)
 
-        if not token_response or 'access_token' not in token_response:
-            raise RuntimeError(f'トークン取得失敗: {token_response}')
+        def acquire_access_token() -> str:
+            """Graph APIアクセストークンを取得する。期限切れ時の再取得にも使用する。"""
+            resp = app.acquire_token_for_client(scopes=SCOPE)
+            if not resp or 'access_token' not in resp:
+                raise RuntimeError(f'トークン取得失敗: {resp}')
+            return resp['access_token']
 
-        access_token = token_response['access_token']
+        # Graph API トークン取得
+        logger.info('Graph API トークンを取得しています...')
+        access_token = acquire_access_token()
         logger.info('Graph API トークンを取得しました')
 
         # 除外フォルダ設定を取得
@@ -91,7 +96,8 @@ def main():
             cutoff_dt,
             access_token,
             not_folder=not_folder,
-            not_folder_keywords=not_folder_keywords
+            not_folder_keywords=not_folder_keywords,
+            token_refresher=acquire_access_token,
         )
 
         logger.info(f'メールサーバー削除完了: 削除={deleted_count}件, エラー={error_count}件')
