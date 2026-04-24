@@ -1,5 +1,5 @@
 from datetime import datetime, timezone, timedelta
-from typing import List, Tuple, Union
+from typing import Callable, List, Tuple, Union
 import logging
 import json
 import sqlite3
@@ -29,7 +29,11 @@ def _format_dt(dt: Union[datetime, str]) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def list_mail_folders(user_email: str, access_token: str) -> List[Tuple[str, str]]:
+def list_mail_folders(
+    user_email: str,
+    access_token: str,
+    token_refresher: Callable[[], str] = None,
+) -> List[Tuple[str, str]]:
     """メールボックスのトップレベルフォルダ一覧を取得します。
 
     :param user_email: 対象メールボックスのアドレス。
@@ -38,9 +42,38 @@ def list_mail_folders(user_email: str, access_token: str) -> List[Tuple[str, str
     """
     rows: List[Tuple[str, str]] = []
     url = f"https://graph.microsoft.com/v1.0/users/{user_email}/mailFolders"
+    current_token = access_token
+
+    def _refresh_access_token() -> None:
+        nonlocal current_token
+        if token_refresher is None:
+            raise RuntimeError("アクセストークンの有効期限が切れました。再取得関数が設定されていません。")
+        new_token = token_refresher()
+        if not new_token:
+            raise RuntimeError("アクセストークン再取得に失敗しました。")
+        current_token = new_token
+        logger.info("Graph API access token refreshed while listing folders")
+
+    def _is_expired_token_response(resp: requests.Response) -> bool:
+        if resp.status_code != 401:
+            return False
+        body = resp.text or ""
+        return "InvalidAuthenticationToken" in body and (
+            "token is expired" in body.lower() or "lifetime validation failed" in body.lower()
+        )
+
     # ページネーションに対応して全件取得する。
     while url:
-        resp = requests.get(url, headers={"Authorization": f"Bearer {access_token}"})
+        resp = requests.get(url, headers={"Authorization": f"Bearer {current_token}"})
+
+        # トークン期限切れ時は一度だけ再取得してリトライする。
+        if _is_expired_token_response(resp):
+            try:
+                _refresh_access_token()
+                resp = requests.get(url, headers={"Authorization": f"Bearer {current_token}"})
+            except Exception as refresh_error:
+                logger.error(f"Failed to refresh access token while listing folders: {refresh_error}")
+
         # APIエラー時は空リストを返す。
         if resp.status_code != 200:
             logger.debug(f"Failed to list folders: {resp.status_code} {resp.text}")
@@ -64,6 +97,7 @@ def get_mail_subjects(
     talent_keywords: List[str] = None,
     not_folder: List[str] = None,
     not_folder_keywords: List[str] = None,
+    token_refresher: Callable[[], str] = None,
 ) -> List[Tuple[str, str]]:
     """指定期間のメール件名を取得し、分類に応じてDB保存します。
 
@@ -89,6 +123,32 @@ def get_mail_subjects(
         "Authorization": f"Bearer {access_token}",
         "Prefer": 'outlook.timezone="Tokyo Standard Time", outlook.body-content-type="text"',
     }
+
+    def _is_expired_token_response(resp: requests.Response) -> bool:
+        if resp.status_code != 401:
+            return False
+        body = resp.text or ""
+        return "InvalidAuthenticationToken" in body and (
+            "token is expired" in body.lower() or "lifetime validation failed" in body.lower()
+        )
+
+    def _refresh_access_token() -> None:
+        nonlocal access_token, headers
+        if token_refresher is None:
+            raise RuntimeError("アクセストークンの有効期限が切れました。再取得関数が設定されていません。")
+        new_token = token_refresher()
+        if not new_token:
+            raise RuntimeError("アクセストークン再取得に失敗しました。")
+        access_token = new_token
+        headers["Authorization"] = f"Bearer {new_token}"
+        logger.info("Graph API access token refreshed after expiration")
+
+    def _graph_get(url: str) -> requests.Response:
+        resp = requests.get(url, headers=headers)
+        if _is_expired_token_response(resp):
+            _refresh_access_token()
+            resp = requests.get(url, headers=headers)
+        return resp
     # 取得期間の日時をGraph API用のUTC ISO文字列に変換する。
     start_iso = _format_dt(start_dt)
     # 取得終了日時も同様に変換する。
@@ -124,7 +184,7 @@ def get_mail_subjects(
         )
         # API呼び出しの共通ヘッダを定義する。
         while url:
-            resp = requests.get(url, headers=headers)
+            resp = _graph_get(url)
             logger.debug(f"GET {url}")
             logger.debug(f"status {resp.status_code}")
             # APIエラー時はループを抜ける。
@@ -146,9 +206,8 @@ def get_mail_subjects(
                 folder_name = None
                 # parent_idからフォルダ名を取得する。APIエラーなどで取得できない場合はIDを代わりに使う。
                 try:
-                    fresp = requests.get(
+                    fresp = _graph_get(
                         f"https://graph.microsoft.com/v1.0/users/{user_email}/mailFolders/{parent_id}",
-                        headers=headers,
                     )
                     if fresp.status_code == 200:
                         folder_name = fresp.json().get("displayName")
@@ -193,7 +252,7 @@ def get_mail_subjects(
         else:
             folder_url = f"https://graph.microsoft.com/v1.0/users/{user_email}/mailFolders/{folder_path}"
 
-        response = requests.get(folder_url, headers=headers)
+        response = _graph_get(folder_url)
         # APIエラー時は処理を中断する。特に403は権限不足の可能性が高いため、わかりやすいエラーメッセージを出す。
         if response.status_code != 200:
             if response.status_code == 403:
@@ -214,7 +273,7 @@ def get_mail_subjects(
 
         if include_subfolders:
             child_url = f"https://graph.microsoft.com/v1.0/users/{user_email}/mailFolders/{folder_id}/childFolders"
-            child_resp = requests.get(child_url, headers=headers)
+            child_resp = _graph_get(child_url)
             logger.debug(f"GET childFolders {child_url} status {child_resp.status_code}")
             if child_resp.status_code != 200:
                 logger.debug(f"childFolders error: {child_resp.status_code} {child_resp.text}")
@@ -225,9 +284,8 @@ def get_mail_subjects(
             # API応答が空でもInbox配下がある環境向けに名前指定で再取得する。
             if len(children) == 0:
                 try:
-                    finfo = requests.get(
+                    finfo = _graph_get(
                         f"https://graph.microsoft.com/v1.0/users/{user_email}/mailFolders/{folder_id}",
-                        headers=headers,
                     )
                     if finfo.status_code == 200:
                         fname = finfo.json().get("displayName", "")
@@ -236,7 +294,7 @@ def get_mail_subjects(
                             fallback_url = (
                                 f"https://graph.microsoft.com/v1.0/users/{user_email}/mailFolders/Inbox/childFolders"
                             )
-                            fr = requests.get(fallback_url, headers=headers)
+                            fr = _graph_get(fallback_url)
                             logger.debug(f"Fallback GET childFolders by name {fallback_url} status {fr.status_code}")
                             if fr.status_code == 200:
                                 children = fr.json().get("value", [])
@@ -256,7 +314,7 @@ def get_mail_subjects(
                     recurse_folder(cid)
 
     # トップレベルのフォルダ一覧を取得してから、各フォルダを再帰的に処理する。
-    for folder_name, folder_id in list_mail_folders(user_email, access_token):
+    for folder_name, folder_id in list_mail_folders(user_email, access_token, token_refresher=token_refresher):
         try:
             # トップレベルフォルダも除外ルールを適用する。
             if should_skip_folder(folder_name, not_folder, not_folder_keywords):

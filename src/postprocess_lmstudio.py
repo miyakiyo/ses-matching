@@ -20,6 +20,9 @@ def _sanitize_text_for_lm_request(text: str) -> str:
     """LM Studio 送信用に、JSONペイロード化で問題になり得る文字を除去する。"""
     normalized = text if isinstance(text, str) else str(text)
 
+    # コードフェンス（```json / ```）が本文中にあると LM Studio の入力パーサが pos 0 でクラッシュする
+    normalized = normalized.replace("```json", "").replace("```", "").strip()
+
     # メーラー由来の自動リンク <https://...> は、そのままだと入力パーサと相性が悪いことがある
     normalized = re.sub(r"<((?:https?|mailto):[^>]+)>", r"\1", normalized)
 
@@ -653,7 +656,7 @@ def _sanitize_json_like_content(content: str) -> str:
 
     # 例: "https": //example.com/path -> "https://example.com/path"
     normalized = re.sub(
-        r'"(https?)"\s*:\s*(//[^"\],}]+)',
+        r'"(https?)"\s*:\s*(//[^"\],}\[]+)',
         r'"\1:\2"',
         normalized,
     )
@@ -672,6 +675,15 @@ def _sanitize_json_like_content(content: str) -> str:
         normalized,
     )
 
+    # 例: "調整可能時間帯": "[140-180h] -> "調整可能時間帯": "[140-180h]"（閉じクォート欠落）
+    # 値が "[..." で始まり "]" で終わった直後に閉じクォートが無いケースを補正する。
+    # この補正は URL 補正より後、"経験度"修正より前に実行する必要がある。
+    normalized = re.sub(
+        r'(:\s*"\[(?:[^\]"\\]|\\.)*\])(?!\s*"|\s*:)(?=\s*[,}\]])',
+        r'\1"',
+        normalized,
+    )
+
     # 例: "経験度":"...SQL など）}, { -> "経験度":"...SQL など）"}, {
     normalized = re.sub(
         r'(:\s*"[^"\{\}\[\]]*?)\}([\s,]*\{)',
@@ -679,11 +691,29 @@ def _sanitize_json_like_content(content: str) -> str:
         normalized,
     )
 
+    # 例: "歓迎要件": ["...", "...") } , "募集人数": ... -> ... ], "募集人数": ...
+    # 文字列配列の閉じ括弧が誤って } になったケースを補正する。
+    normalized = re.sub(
+        r'(:\s*\[(?:\s*"(?:[^"\\]|\\.)*"\s*,)*\s*"(?:[^"\\]|\\.)*"\s*)\}(?=\s*,\s*"(?:[^"\\]|\\.)+"\s*:)',
+        r'\1]',
+        normalized,
+    )
+
+    # 例: ... "企業情報": {...} ]} -> ... "企業情報": {...}}
+    # 末尾に紛れ込んだ孤立 ] を除去する。
+    normalized = re.sub(
+        r'(\}\s*)\](\s*\}\s*)$',
+        r'\1\2',
+        normalized,
+    )
+
     # 例: "text""] -> "text"]（補正ルール競合で二重クォートになった末尾を畳む）
     normalized = re.sub(r'""(?=\s*[,}\]])', r'"', normalized)
 
     # 例: }"]} のような閉じ構造直後の余剰クォートを除去
-    normalized = re.sub(r'([}\]])"(?=\s*[}\],])', r'\1', normalized)
+    # ただし文字列値内の "]" の後のクォートは除去しない（"[140-180h]" + "}" の誤検知防止）
+    # -> 直前がスペース・カンマ・開き括弧ではなく、正規のJSON構造の閉じとみなされる場合のみ
+    normalized = re.sub(r'(\})"(?=\s*[}\],])', r'\1', normalized)
 
     # 文字列内の生改行などを JSON エスケープへ変換
     # 注：この処理は改行正規化の後に実行すること
@@ -798,6 +828,13 @@ def _sanitize_json_like_content(content: str) -> str:
         _quote_bare_identifier_in_array,
     )
 
+    # 例: [200名超] / [50代以上] -> ["200名超"] / ["50代以上"]（数字+文字の裸値を文字列化）
+    normalized = _regex_sub_outside_json_strings(
+        normalized,
+        r'(?<=[\[,])\s*(-?\d+(?:\.\d+)?\s*[^\d,\]\[{}":\s\n][^,\]\[{}":\s\n]{0,80})\s*(?=[,\]])',
+        lambda m: f'"{m.group(1).strip()}"',
+    )
+
     # 例: "A": ①B": true -> "A": true, "①B": true
     # 丸数字で始まる値が次キーに崩れているケースを、JSONとして成立する形に補正する。
     normalized = _regex_sub_outside_json_strings(
@@ -900,6 +937,13 @@ def _sanitize_json_like_content(content: str) -> str:
     normalized = re.sub(
         r'("(?:[^"\\]|\\.)+"\s*:\s*)"([^"\\]*?)\s*,\s*"([^"\\,:]{1,120})\s*,\s*"_extra_item_\d+"\s*:\s*":\s*"([^"\\]*)"',
         r'\1"\2", "\3": "\4"',
+        normalized,
+    )
+
+    # 3.2) 例: "技能情報, "_extra_item_1": ": { -> "技能情報": {（オブジェクト値を持つキーの崩れ）
+    normalized = re.sub(
+        r'"([^"\\,:]{1,120})\s*,\s*"_extra_item_\d+"\s*:\s*":\s*(\{)',
+        r'"\1": \2',
         normalized,
     )
 
@@ -1010,6 +1054,8 @@ def _call_lmstudio(
 
     body_text = _sanitize_text_for_lm_request(body_text)
     body_text = _strip_problematic_unicode(body_text)
+    # UTF-8 encode→decode で残留不正バイトを確実に除去（LM Studio parse 400 対策）
+    body_text = body_text.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
     system_content = _sanitize_text_for_lm_request(system_content)
     system_content = _strip_problematic_unicode(system_content)
 
@@ -1106,15 +1152,19 @@ def _call_lmstudio(
         )
         can_retry_with_shorter_prompt = i < len(request_variants) - 1
 
-        if is_retryable_400 and can_retry_with_shorter_prompt:
+        if is_retryable_400:
             logger.warning(
-                "LM Studio API retryable error: status=%s, body=%s",
+                "LM Studio API retryable error: variant=%s/%s, status=%s, body=%s",
+                i + 1,
+                len(request_variants),
                 resp.status_code,
                 resp.text,
             )
         else:
             logger.error(
-                "LM Studio API error: status=%s, body=%s",
+                "LM Studio API error: variant=%s/%s, status=%s, body=%s",
+                i + 1,
+                len(request_variants),
                 resp.status_code,
                 resp.text,
             )
@@ -1125,12 +1175,28 @@ def _call_lmstudio(
             last_http_error = e
             if is_retryable_400 and can_retry_with_shorter_prompt:
                 logger.warning(
-                    "LM Studio request retry with fallback payload: category=%s, chars=%s -> %s",
+                    "LM Studio request retry with fallback payload: category=%s, variant=%s/%s, chars=%s -> %s",
                     category,
+                    i + 1,
+                    len(request_variants),
                     len(prompt_variant),
                     len(request_variants[i + 1][1]),
                 )
                 continue
+
+            if is_retryable_400 and not can_retry_with_shorter_prompt:
+                logger.warning(
+                    "LM Studio request exhausted retryable fallbacks: category=%s, variant=%s/%s; applying API fallback",
+                    category,
+                    i + 1,
+                    len(request_variants),
+                )
+                fallback_obj = {
+                    "raw_content": body_text,
+                    "sanitize_error": "api_input_parse_fallback",
+                    "api_error": (resp.text or str(e))[:1000],
+                }
+                return json.dumps(fallback_obj, ensure_ascii=False)
             raise
 
     if resp is None:

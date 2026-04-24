@@ -211,7 +211,7 @@ def _run_mail_fetch(conn, access_token: str) -> datetime:
     mailbox = config.get('mailbox', {}).get('shared_mailbox', '*****@offgrid.co.jp')
     last_run_at = get_last_run_at(conn)
 
-    folders = list_mail_folders(mailbox, access_token)
+    folders = list_mail_folders(mailbox, access_token, token_refresher=_acquire_access_token)
     logger.info('Folders visible via Graph:')
     for name, fid in folders:
         logger.info(f'- {name} {fid}')
@@ -235,6 +235,7 @@ def _run_mail_fetch(conn, access_token: str) -> datetime:
         talent_keywords=talent_keywords,
         not_folder=NOT_FOLDER,
         not_folder_keywords=NOT_FOLDER_KEYWORDS,
+        token_refresher=_acquire_access_token,
     )
 
     unclassified_log_path = config.get('ses', {}).get('unclassified_log_path', 'logs/unclassified.log')
