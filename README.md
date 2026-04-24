@@ -28,8 +28,8 @@ CLIオプション未指定時に、処理ごとの実行可否を設定でき�
 ```yaml
 processes:
   mail_fetch: true           # メール取得
-  lm_postprocess_human: true # LLM処理（人材）
-  lm_postprocess_case: true  # LLM処理（案件）
+  lm_postprocess_talent: true # LLM処理（人材）
+  lm_postprocess_project: true  # LLM処理（案件）
   matching: true             # マッチング
   delete_old: true           # 古いレコード削除
   csv_export: true           # CSV出力

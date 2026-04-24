@@ -13,9 +13,35 @@ def init_db(db_path: str = "DB/mails.db") -> sqlite3.Connection:
     :return: 初期化済みのDBコネクション。
     """
     conn = sqlite3.connect(db_path)
+
+    # 既存DBの命名を project/talent へ移行する（旧名があり新名がない場合のみ）。
+    existing_tables = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+
+    if "mails_human" in existing_tables and "mails_talent" not in existing_tables:
+        conn.execute("ALTER TABLE mails_human RENAME TO mails_talent")
+    if "mails_case" in existing_tables and "mails_project" not in existing_tables:
+        conn.execute("ALTER TABLE mails_case RENAME TO mails_project")
+    if "matches_human_case" in existing_tables and "matches" not in existing_tables:
+        conn.execute("ALTER TABLE matches_human_case RENAME TO matches")
+    if "matches_talent_project" in existing_tables and "matches" not in existing_tables:
+        conn.execute("ALTER TABLE matches_talent_project RENAME TO matches")
+
+    # 旧カラム名が残っている場合に project/talent へ移行する。
+    match_columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(matches)").fetchall()
+    }
+    if "human_id" in match_columns and "talent_id" not in match_columns:
+        conn.execute("ALTER TABLE matches RENAME COLUMN human_id TO talent_id")
+    if "case_id" in match_columns and "project_id" not in match_columns:
+        conn.execute("ALTER TABLE matches RENAME COLUMN case_id TO project_id")
+
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS mails_human (
+        CREATE TABLE IF NOT EXISTS mails_talent (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             folder      TEXT,
             subject     TEXT,
@@ -53,7 +79,7 @@ def init_db(db_path: str = "DB/mails.db") -> sqlite3.Connection:
     )
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS mails_case (
+        CREATE TABLE IF NOT EXISTS mails_project (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             folder      TEXT,
             subject     TEXT,
@@ -112,18 +138,36 @@ def init_db(db_path: str = "DB/mails.db") -> sqlite3.Connection:
     )
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS matches_human_case (
+        CREATE TABLE IF NOT EXISTS mails_unclassified (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            folder      TEXT,
+            subject     TEXT,
+            sender_name TEXT,
+            sender_addr TEXT,
+            received_at TEXT,
+            body        TEXT,
+            status      VARCHAR(1) NOT NULL DEFAULT '0',
+            json_data   TEXT,
+            created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(sender_addr, subject, received_at)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS matches (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            human_id   INTEGER NOT NULL,
-            case_id    INTEGER NOT NULL,
+            talent_id   INTEGER NOT NULL,
+            project_id    INTEGER NOT NULL,
             score      INTEGER NOT NULL DEFAULT 0,
             reason     TEXT,
             status     VARCHAR(1) NOT NULL DEFAULT '0',
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (human_id) REFERENCES mails_human(id),
-            FOREIGN KEY (case_id) REFERENCES mails_case(id),
-            UNIQUE(human_id, case_id)
+            FOREIGN KEY (talent_id) REFERENCES mails_talent(id),
+            FOREIGN KEY (project_id) REFERENCES mails_project(id),
+            UNIQUE(talent_id, project_id)
         )
         """
     )
@@ -167,40 +211,40 @@ def delete_old_records(conn: sqlite3.Connection, days: int = 7) -> tuple:
 
     :param conn: SQLiteコネクション。
     :param days: 保持日数（デフォルト7日）。
-    :return: (削除した mails_human 件数, 削除した mails_case 件数, 削除した run_history 件数) のタプル。
+    :return: (削除した mails_talent 件数, 削除した mails_project 件数, 削除した run_history 件数) のタプル。
     """
     # 指定日数前の日時をUTC ISO形式で計算する。
     cutoff_dt = datetime.now(timezone.utc) - timedelta(days=days)
     cutoff_str = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # matches_human_case に参照がある親レコードは削除対象から除外する。
-    human_cursor = conn.execute(
+    # matches に参照がある親レコードは削除対象から除外する。
+    talent_cursor = conn.execute(
         """
-        DELETE FROM mails_human
+        DELETE FROM mails_talent
         WHERE received_at < ?
           AND NOT EXISTS (
               SELECT 1
-              FROM matches_human_case
-              WHERE matches_human_case.human_id = mails_human.id
+              FROM matches
+              WHERE matches.talent_id = mails_talent.id
           )
         """,
         (cutoff_str,),
     )
-    deleted_human = human_cursor.rowcount
+    deleted_talent = talent_cursor.rowcount
 
-    case_cursor = conn.execute(
+    project_cursor = conn.execute(
         """
-        DELETE FROM mails_case
+        DELETE FROM mails_project
         WHERE received_at < ?
           AND NOT EXISTS (
               SELECT 1
-              FROM matches_human_case
-              WHERE matches_human_case.case_id = mails_case.id
+              FROM matches
+              WHERE matches.project_id = mails_project.id
           )
         """,
         (cutoff_str,),
     )
-    deleted_case = case_cursor.rowcount
+    deleted_project = project_cursor.rowcount
 
     # run_history テーブルから古いレコードを削除する。
     history_cursor = conn.execute("DELETE FROM run_history WHERE run_at < ?", (cutoff_str,))
@@ -208,7 +252,7 @@ def delete_old_records(conn: sqlite3.Connection, days: int = 7) -> tuple:
     
     conn.commit()
 
-    return (deleted_human, deleted_case, deleted_history)
+    return (deleted_talent, deleted_project, deleted_history)
 
 
 def export_tables_to_csv(conn: sqlite3.Connection, output_dir: str = "csv_exports") -> list[str]:
@@ -222,7 +266,7 @@ def export_tables_to_csv(conn: sqlite3.Connection, output_dir: str = "csv_export
     output_path.mkdir(parents=True, exist_ok=True)
 
     exported_files: list[str] = []
-    table_names = ["mails_human", "mails_case", "run_history", "matches_human_case"]
+    table_names = ["mails_talent", "mails_project", "run_history", "matches"]
 
     for table_name in table_names:
         cursor = conn.execute(f"SELECT * FROM {table_name}")
@@ -238,6 +282,45 @@ def export_tables_to_csv(conn: sqlite3.Connection, output_dir: str = "csv_export
 
         exported_files.append(str(csv_path))
 
+    # matches_joined.csv: matchesテーブルをmails_talentとmails_projectと連結したCSV
+    joined_cursor = conn.execute(
+        """
+        SELECT
+            t.folder AS talent_folder,
+            t.subject AS talent_subject,
+            t.body AS talent_body,
+            t.received_at AS talent_received_at,
+            p.folder AS project_folder,
+            p.subject AS project_subject,
+            p.body AS project_body,
+            p.received_at AS project_received_at,
+            m.score AS score
+        FROM matches AS m
+        LEFT JOIN mails_talent AS t ON t.id = m.talent_id
+        LEFT JOIN mails_project AS p ON p.id = m.project_id
+        ORDER BY m.score DESC, m.id DESC
+        """
+    )
+    joined_rows = joined_cursor.fetchall()
+
+    joined_csv_path = output_path / "matches_joined.csv"
+    with joined_csv_path.open("w", newline="", encoding="utf-8-sig") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow([
+                "talent_folder",
+                "talent_subject",
+                "talent_body",
+                "talent_received_at",
+                "project_folder",
+                "project_subject",
+                "project_body",
+                "project_received_at",
+                "score",
+        ])
+        writer.writerows(joined_rows)
+
+    exported_files.append(str(joined_csv_path))
+
     return exported_files
 
 
@@ -250,12 +333,12 @@ def get_pending_records(
     """未処理レコード（status='0'）を取得します。
 
     :param conn: SQLiteコネクション。
-    :param table_name: 対象テーブル名（mails_human または mails_case）。
+    :param table_name: 対象テーブル名（mails_talent または mails_project）。
     :param limit: 取得上限件数。
     :param exclude_folders: 除外するフォルダ名一覧（完全一致・大文字小文字無視）。
     :return: (id, body) のタプル一覧。
     """
-    if table_name not in ("mails_human", "mails_case"):
+    if table_name not in ("mails_talent", "mails_project"):
         raise ValueError(f"Unsupported table_name: {table_name}")
 
     normalized_folders = [
@@ -301,13 +384,13 @@ def update_record_json_status(
     """レコードの json_data/status/updated_at を更新します。
 
     :param conn: SQLiteコネクション。
-    :param table_name: 対象テーブル名（mails_human または mails_case）。
+    :param table_name: 対象テーブル名（mails_talent または mails_project）。
     :param record_id: 更新対象のレコードID。
     :param json_data: 保存するJSON文字列。
     :param status: 更新後ステータス。
     :return: なし。
     """
-    if table_name not in ("mails_human", "mails_case"):
+    if table_name not in ("mails_talent", "mails_project"):
         raise ValueError(f"Unsupported table_name: {table_name}")
 
     conn.execute(
@@ -331,7 +414,7 @@ def update_record_json_status_and_properties(
     status: str = "1",
 ) -> None:
     """json_data/status と schema由来properties列を同時更新します。"""
-    if table_name not in ("mails_human", "mails_case"):
+    if table_name not in ("mails_talent", "mails_project"):
         raise ValueError(f"Unsupported table_name: {table_name}")
 
     allowed_cols = {
@@ -377,33 +460,33 @@ def update_record_json_status_and_properties(
     )
 
 
-def check_existing_match(conn: sqlite3.Connection, human_id: int, case_id: int) -> bool:
+def check_existing_match(conn: sqlite3.Connection, talent_id: int, project_id: int) -> bool:
     """特定の人材-案件マッチングが既に存在するか確認します。
 
     :param conn: SQLiteコネクション。
-    :param human_id: 人材ID。
-    :param case_id: 案件ID。
+    :param talent_id: 人材ID。
+    :param project_id: 案件ID。
     :return: True（既存）、False（新規）。
     """
     result = conn.execute(
-        "SELECT id FROM matches_human_case WHERE human_id = ? AND case_id = ? LIMIT 1",
-        (human_id, case_id),
+        "SELECT id FROM matches WHERE talent_id = ? AND project_id = ? LIMIT 1",
+        (talent_id, project_id),
     ).fetchone()
     return result is not None
 
 
 def add_match(
     conn: sqlite3.Connection,
-    human_id: int,
-    case_id: int,
+    talent_id: int,
+    project_id: int,
     score: int,
     reason: dict,
 ) -> int:
-    """マッチング結果を matches_human_case テーブルに追加または更新します。
+    """マッチング結果を matches テーブルに追加または更新します。
 
     :param conn: SQLiteコネクション。
-    :param human_id: 人材ID。
-    :param case_id: 案件ID。
+    :param talent_id: 人材ID。
+    :param project_id: 案件ID。
     :param score: マッチングスコア（0-100）。
     :param reason: マッチング理由（JSON辞書）。
     :return: 挿入または更新されたレコードID。
@@ -413,20 +496,20 @@ def add_match(
     # UNIQUE 制約により、既存レコードは UPDATE、新規は INSERT される
     conn.execute(
         """
-        INSERT INTO matches_human_case (human_id, case_id, score, reason, status, created_at, updated_at)
+        INSERT INTO matches (talent_id, project_id, score, reason, status, created_at, updated_at)
         VALUES (?, ?, ?, ?, '0', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-        ON CONFLICT(human_id, case_id) DO UPDATE SET
+        ON CONFLICT(talent_id, project_id) DO UPDATE SET
             score = excluded.score,
             reason = excluded.reason,
             updated_at = CURRENT_TIMESTAMP
         """,
-        (human_id, case_id, score, reason_json),
+        (talent_id, project_id, score, reason_json),
     )
     conn.commit()
     
     result = conn.execute(
-        "SELECT id FROM matches_human_case WHERE human_id = ? AND case_id = ?",
-        (human_id, case_id),
+        "SELECT id FROM matches WHERE talent_id = ? AND project_id = ?",
+        (talent_id, project_id),
     ).fetchone()
     return result[0] if result else -1
 
@@ -438,7 +521,7 @@ def get_all_matches(conn: sqlite3.Connection, limit: int = None) -> list[dict]:
     :param limit: 取得上限件数。
     :return: マッチング情報の辞書リスト。
     """
-    sql = "SELECT id, human_id, case_id, score, reason, status, created_at FROM matches_human_case ORDER BY score DESC, id DESC"
+    sql = "SELECT id, talent_id, project_id, score, reason, status, created_at FROM matches ORDER BY score DESC, id DESC"
     if limit:
         sql += f" LIMIT {limit}"
     
@@ -449,8 +532,8 @@ def get_all_matches(conn: sqlite3.Connection, limit: int = None) -> list[dict]:
     for row in rows:
         results.append({
             "id": row[0],
-            "human_id": row[1],
-            "case_id": row[2],
+            "talent_id": row[1],
+            "project_id": row[2],
             "score": row[3],
             "reason": json.loads(row[4]) if row[4] else {},
             "status": row[5],
@@ -459,16 +542,16 @@ def get_all_matches(conn: sqlite3.Connection, limit: int = None) -> list[dict]:
     return results
 
 
-def get_matches_for_human(conn: sqlite3.Connection, human_id: int) -> list[dict]:
+def get_matches_for_talent(conn: sqlite3.Connection, talent_id: int) -> list[dict]:
     """特定の人材のマッチング結果を取得します。
 
     :param conn: SQLiteコネクション。
-    :param human_id: 人材ID。
+    :param talent_id: 人材ID。
     :return: マッチング情報の辞書リスト。
     """
     cursor = conn.execute(
-        "SELECT id, case_id, score, reason, status, created_at FROM matches_human_case WHERE human_id = ? ORDER BY score DESC",
-        (human_id,),
+        "SELECT id, project_id, score, reason, status, created_at FROM matches WHERE talent_id = ? ORDER BY score DESC",
+        (talent_id,),
     )
     rows = cursor.fetchall()
     
@@ -476,7 +559,7 @@ def get_matches_for_human(conn: sqlite3.Connection, human_id: int) -> list[dict]
     for row in rows:
         results.append({
             "id": row[0],
-            "case_id": row[1],
+            "project_id": row[1],
             "score": row[2],
             "reason": json.loads(row[3]) if row[3] else {},
             "status": row[4],
@@ -485,16 +568,16 @@ def get_matches_for_human(conn: sqlite3.Connection, human_id: int) -> list[dict]
     return results
 
 
-def get_matches_for_case(conn: sqlite3.Connection, case_id: int) -> list[dict]:
+def get_matches_for_project(conn: sqlite3.Connection, project_id: int) -> list[dict]:
     """特定の案件のマッチング結果を取得します。
 
     :param conn: SQLiteコネクション。
-    :param case_id: 案件ID。
+    :param project_id: 案件ID。
     :return: マッチング情報の辞書リスト。
     """
     cursor = conn.execute(
-        "SELECT id, human_id, score, reason, status, created_at FROM matches_human_case WHERE case_id = ? ORDER BY score DESC",
-        (case_id,),
+        "SELECT id, talent_id, score, reason, status, created_at FROM matches WHERE project_id = ? ORDER BY score DESC",
+        (project_id,),
     )
     rows = cursor.fetchall()
     
@@ -502,7 +585,7 @@ def get_matches_for_case(conn: sqlite3.Connection, case_id: int) -> list[dict]:
     for row in rows:
         results.append({
             "id": row[0],
-            "human_id": row[1],
+            "talent_id": row[1],
             "score": row[2],
             "reason": json.loads(row[3]) if row[3] else {},
             "status": row[4],
@@ -511,14 +594,14 @@ def get_matches_for_case(conn: sqlite3.Connection, case_id: int) -> list[dict]:
     return results
 
 
-def get_human_record(conn: sqlite3.Connection, human_id: int) -> dict:
+def get_talent_record(conn: sqlite3.Connection, talent_id: int) -> dict:
     """特定の人材レコードを辞書形式で取得します。
 
     :param conn: SQLiteコネクション。
-    :param human_id: 人材ID。
+    :param talent_id: 人材ID。
     :return: 人材レコードの辞書。
     """
-    cursor = conn.execute("SELECT * FROM mails_human WHERE id = ?", (human_id,))
+    cursor = conn.execute("SELECT * FROM mails_talent WHERE id = ?", (talent_id,))
     row = cursor.fetchone()
     if not row:
         return {}
@@ -527,14 +610,14 @@ def get_human_record(conn: sqlite3.Connection, human_id: int) -> dict:
     return dict(zip(col_names, row))
 
 
-def get_case_record(conn: sqlite3.Connection, case_id: int) -> dict:
+def get_project_record(conn: sqlite3.Connection, project_id: int) -> dict:
     """特定の案件レコードを辞書形式で取得します。
 
     :param conn: SQLiteコネクション。
-    :param case_id: 案件ID。
+    :param project_id: 案件ID。
     :return: 案件レコードの辞書。
     """
-    cursor = conn.execute("SELECT * FROM mails_case WHERE id = ?", (case_id,))
+    cursor = conn.execute("SELECT * FROM mails_project WHERE id = ?", (project_id,))
     row = cursor.fetchone()
     if not row:
         return {}

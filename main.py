@@ -38,13 +38,13 @@ logger = logging.getLogger(__name__)
 
 NOT_FOLDER = config.get('mailbox', {}).get('not_folder', [])
 NOT_FOLDER_KEYWORDS = config.get('mailbox', {}).get('not_folder_keywords', [])
-LM_EXCLUDE_FOLDERS_HUMAN = config.get('mailbox', {}).get('lm_exclude_folders_human', [])
-LM_EXCLUDE_FOLDERS_CASE = config.get('mailbox', {}).get('lm_exclude_folders_case', [])
+LM_EXCLUDE_FOLDERS_TALENT = config.get('mailbox', {}).get('lm_exclude_folders_talent', [])
+LM_EXCLUDE_FOLDERS_PROJECT = config.get('mailbox', {}).get('lm_exclude_folders_project', [])
 
 PROCESS_DEFAULTS = {
     'mail_fetch': True,
-    'lm_postprocess_human': True,
-    'lm_postprocess_case': True,
+    'lm_postprocess_talent': True,
+    'lm_postprocess_project': True,
     'matching': True,
     'delete_old': True,
     'csv_export': True,
@@ -110,8 +110,8 @@ def _resolve_process_plan(args: argparse.Namespace, process_config: dict[str, bo
     if args.m:
         return {
             'mail_fetch': True,
-            'lm_postprocess_human': False,
-            'lm_postprocess_case': False,
+            'lm_postprocess_talent': False,
+            'lm_postprocess_project': False,
             'matching': False,
             'delete_old': False,
             'csv_export': False,
@@ -119,8 +119,8 @@ def _resolve_process_plan(args: argparse.Namespace, process_config: dict[str, bo
     if args.l:
         return {
             'mail_fetch': False,
-            'lm_postprocess_human': True,
-            'lm_postprocess_case': True,
+            'lm_postprocess_talent': True,
+            'lm_postprocess_project': True,
             'matching': False,
             'delete_old': False,
             'csv_export': False,
@@ -128,8 +128,8 @@ def _resolve_process_plan(args: argparse.Namespace, process_config: dict[str, bo
     if args.n:
         return {
             'mail_fetch': False,
-            'lm_postprocess_human': False,
-            'lm_postprocess_case': False,
+            'lm_postprocess_talent': False,
+            'lm_postprocess_project': False,
             'matching': True,
             'delete_old': False,
             'csv_export': False,
@@ -137,8 +137,8 @@ def _resolve_process_plan(args: argparse.Namespace, process_config: dict[str, bo
     if args.d:
         return {
             'mail_fetch': False,
-            'lm_postprocess_human': False,
-            'lm_postprocess_case': False,
+            'lm_postprocess_talent': False,
+            'lm_postprocess_project': False,
             'matching': False,
             'delete_old': True,
             'csv_export': False,
@@ -146,8 +146,8 @@ def _resolve_process_plan(args: argparse.Namespace, process_config: dict[str, bo
     if args.c:
         return {
             'mail_fetch': False,
-            'lm_postprocess_human': False,
-            'lm_postprocess_case': False,
+            'lm_postprocess_talent': False,
+            'lm_postprocess_project': False,
             'matching': False,
             'delete_old': False,
             'csv_export': True,
@@ -155,8 +155,8 @@ def _resolve_process_plan(args: argparse.Namespace, process_config: dict[str, bo
     if args.a:
         return {
             'mail_fetch': True,
-            'lm_postprocess_human': True,
-            'lm_postprocess_case': True,
+            'lm_postprocess_talent': True,
+            'lm_postprocess_project': True,
             'matching': True,
             'delete_old': True,
             'csv_export': True,
@@ -249,9 +249,9 @@ def _run_mail_fetch(conn, access_token: str) -> datetime:
     return end
 
 
-def _run_lm_postprocess(conn, run_human: bool = True, run_case: bool = True) -> None:
+def _run_lm_postprocess(conn, run_talent: bool = True, run_project: bool = True) -> None:
     """LM後処理を実行します。"""
-    if not run_human and not run_case:
+    if not run_talent and not run_project:
         logger.info('LM後処理は設定によりスキップされました。')
         return
 
@@ -261,13 +261,13 @@ def _run_lm_postprocess(conn, run_human: bool = True, run_case: bool = True) -> 
     lmstudio_max_tokens = max(1, int(config.get('lmstudio', {}).get('max_tokens', 512)))
     lmstudio_limit = int(config.get('lmstudio', {}).get('limit_per_table', 500))
     lmstudio_num_workers = max(1, int(config.get('lmstudio', {}).get('num_workers', 4)))
-    lm_exclude_folders_human = [str(name).strip() for name in LM_EXCLUDE_FOLDERS_HUMAN if str(name).strip()]
-    lm_exclude_folders_case = [str(name).strip() for name in LM_EXCLUDE_FOLDERS_CASE if str(name).strip()]
+    lm_exclude_folders_talent = [str(name).strip() for name in LM_EXCLUDE_FOLDERS_TALENT if str(name).strip()]
+    lm_exclude_folders_project = [str(name).strip() for name in LM_EXCLUDE_FOLDERS_PROJECT if str(name).strip()]
     enabled_tables = []
-    if run_human:
-        enabled_tables.append('mails_human')
-    if run_case:
-        enabled_tables.append('mails_case')
+    if run_talent:
+        enabled_tables.append('mails_talent')
+    if run_project:
+        enabled_tables.append('mails_project')
 
     lm_success, lm_error = process_pending_records_with_lmstudio(
         conn=conn,
@@ -276,8 +276,8 @@ def _run_lm_postprocess(conn, run_human: bool = True, run_case: bool = True) -> 
         timeout=lmstudio_timeout,
         max_tokens=lmstudio_max_tokens,
         limit_per_table=lmstudio_limit,
-        exclude_folders_human=lm_exclude_folders_human,
-        exclude_folders_case=lm_exclude_folders_case,
+        exclude_folders_talent=lm_exclude_folders_talent,
+        exclude_folders_project=lm_exclude_folders_project,
         enabled_tables=enabled_tables,
         run_matching=False,
         max_workers=lmstudio_num_workers,
@@ -287,8 +287,8 @@ def _run_lm_postprocess(conn, run_human: bool = True, run_case: bool = True) -> 
 
 def _run_delete_old_records(conn) -> None:
     """古いレコード削除を実行します。"""
-    deleted_human, deleted_case, deleted_history = delete_old_records(conn, days=7)
-    logger.info(f'削除完了: mails_human={deleted_human}件, mails_case={deleted_case}件, run_history={deleted_history}件')
+    deleted_talent, deleted_project, deleted_history = delete_old_records(conn, days=7)
+    logger.info(f'削除完了: mails_talent={deleted_talent}件, mails_project={deleted_project}件, run_history={deleted_history}件')
 
 
 def _run_csv_export(conn) -> None:
@@ -335,11 +335,11 @@ if __name__ == '__main__':
         else:
             logger.info('メール取得は設定によりスキップされました。')
 
-        if process_plan['lm_postprocess_human'] or process_plan['lm_postprocess_case']:
+        if process_plan['lm_postprocess_talent'] or process_plan['lm_postprocess_project']:
             _run_lm_postprocess(
                 conn,
-                run_human=process_plan['lm_postprocess_human'],
-                run_case=process_plan['lm_postprocess_case'],
+                run_talent=process_plan['lm_postprocess_talent'],
+                run_project=process_plan['lm_postprocess_project'],
             )
         else:
             logger.info('LM後処理は設定によりスキップされました。')

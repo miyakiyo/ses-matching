@@ -17,10 +17,11 @@ def classify_ses_subject(subject: str, project_keywords: List[str], talent_keywo
     project_hit = any(k and k.lower() in normalized for k in project_keywords)
     talent_hit = any(k and k.lower() in normalized for k in talent_keywords)
 
-    if project_hit:
-        return "案件"
     if talent_hit:
         return "人材"
+    if project_hit:
+        return "案件"
+
     return "未分類"
 
 

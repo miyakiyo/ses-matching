@@ -1299,8 +1299,8 @@ def process_pending_records_with_lmstudio(
     timeout: int = 60,
     max_tokens: int = 512,
     limit_per_table: int = 500,
-    exclude_folders_human: list[str] | None = None,
-    exclude_folders_case: list[str] | None = None,
+    exclude_folders_talent: list[str] | None = None,
+    exclude_folders_project: list[str] | None = None,
     enabled_tables: list[str] | None = None,
     run_matching: bool = True,
     max_workers: int = 4,
@@ -1309,27 +1309,27 @@ def process_pending_records_with_lmstudio(
     total_success = 0
     total_error = 0
     normalized_workers = max(1, int(max_workers))
-    enabled_tables_set = set(enabled_tables) if enabled_tables else {"mails_human", "mails_case"}
-    normalized_excludes_human = [
+    enabled_tables_set = set(enabled_tables) if enabled_tables else {"mails_talent", "mails_project"}
+    normalized_excludes_talent = [
         str(folder_name).strip()
-        for folder_name in (exclude_folders_human or [])
+        for folder_name in (exclude_folders_talent or [])
         if str(folder_name).strip()
     ]
-    normalized_excludes_case = [
+    normalized_excludes_project = [
         str(folder_name).strip()
-        for folder_name in (exclude_folders_case or [])
+        for folder_name in (exclude_folders_project or [])
         if str(folder_name).strip()
     ]
 
-    for table_name in ("mails_human", "mails_case"):
+    for table_name in ("mails_talent", "mails_project"):
         if table_name not in enabled_tables_set:
             logger.info(f"LM後処理スキップ: table={table_name}")
             continue
 
         current_excludes = (
-            normalized_excludes_human
-            if table_name == "mails_human"
-            else normalized_excludes_case
+            normalized_excludes_talent
+            if table_name == "mails_talent"
+            else normalized_excludes_project
         )
         records = get_pending_records(
             conn,
@@ -1337,7 +1337,7 @@ def process_pending_records_with_lmstudio(
             limit=limit_per_table,
             exclude_folders=current_excludes,
         )
-        category = "人材" if table_name == "mails_human" else "案件"
+        category = "人材" if table_name == "mails_talent" else "案件"
         logger.info(
             f"LM後処理開始: table={table_name}, pending={len(records)}, excluded_folders={current_excludes}, workers={normalized_workers}"
         )

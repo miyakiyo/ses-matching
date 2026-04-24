@@ -221,19 +221,21 @@ def get_mail_subjects(
                         # 件名分類に応じて保存先テーブルを切り替える。
                         category = classify_ses_subject(subj, project_keywords, talent_keywords)
                         table_name = None
-                        # 案件なら mails_case、人材なら mails_human テーブルに保存する。未分類は保存しない。
+                        # 分類結果に応じて保存先テーブルを決定する。
                         if category == "人材":
-                            table_name = "mails_human"
+                            table_name = "mails_talent"
                         elif category == "案件":
-                            table_name = "mails_case"
+                            table_name = "mails_project"
+                        else:  # 未分類
+                            table_name = "mails_unclassified"
 
-                        if table_name is not None:
-                            json_payload = json.dumps(item, ensure_ascii=False)
-                            conn.execute(
-                                f"INSERT OR IGNORE INTO {table_name} "
-                                "(folder, subject, sender_name, sender_addr, received_at, body, status, json_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                                (folder_name or parent_id, subj, sender_name, sender_addr, received, body, '0', json_payload),
-                            )
+                        # 全分類（人材、案件、未分類）をテーブルに保存する。
+                        json_payload = json.dumps(item, ensure_ascii=False)
+                        conn.execute(
+                            f"INSERT OR IGNORE INTO {table_name} "
+                            "(folder, subject, sender_name, sender_addr, received_at, body, status, json_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            (folder_name or parent_id, subj, sender_name, sender_addr, received, body, '0', json_payload),
+                        )
 
             if conn is not None:
                 # ページ単位でコミットして処理途中の再実行をしやすくする。
