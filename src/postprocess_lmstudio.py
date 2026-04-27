@@ -1030,7 +1030,7 @@ def _call_lmstudio(
     body_text: str,
     category: str,
     timeout: int = 60,
-    max_tokens: int = 512,
+    max_tokens: int = 2048,
 ) -> str:
     """LM Studio に本文を送り、JSON文字列を返します。"""
     if category == "案件":
@@ -1296,14 +1296,14 @@ def process_pending_records_with_lmstudio(
     conn: sqlite3.Connection,
     endpoint: str,
     model: str,
-    timeout: int = 60,
-    max_tokens: int = 512,
+    timeout: int = 120,
+    max_tokens: int = 2048,
     limit_per_table: int = 500,
     exclude_folders_talent: list[str] | None = None,
     exclude_folders_project: list[str] | None = None,
     enabled_tables: list[str] | None = None,
     run_matching: bool = True,
-    max_workers: int = 4,
+    max_workers: int = 1,
 ) -> tuple[int, int]:
     """status='0' のレコードを LM Studio でJSON化して保存します。"""
     total_success = 0
