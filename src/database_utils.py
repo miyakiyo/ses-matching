@@ -3,7 +3,11 @@ from pathlib import Path
 from typing import Optional
 import csv
 import json
+import logging
 import sqlite3
+
+
+logger = logging.getLogger(__name__)
 
 
 def init_db(db_path: str = "DB/mails.db") -> sqlite3.Connection:
@@ -432,11 +436,21 @@ def update_record_json_status_and_properties(
         return str(value)
 
     prop_items = []
+    unknown_cols = []
     for key, value in properties.items():
         col_name = str(key)
         if col_name not in allowed_cols:
+            unknown_cols.append(col_name)
             continue
         prop_items.append((col_name, _to_text(value)))
+
+    if unknown_cols:
+        logger.warning(
+            "Table column mismatch detected: table=%s, id=%s, unknown_columns=%s",
+            table_name,
+            record_id,
+            sorted(set(unknown_cols)),
+        )
 
     set_parts = [
         "json_data = ?",

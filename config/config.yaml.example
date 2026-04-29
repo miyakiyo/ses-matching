@@ -34,5 +34,8 @@ lmstudio:
   endpoint: http://localhost:1234/v1/chat/completions
   model: Qwen2.5-7B-Instruct-GGUF
   timeout: 60
+  max_tokens: 4096
   limit_per_table: 500
   num_workers: 4
+  signature_trim_chars: 300
+  greeting_trim_chars: 100

@@ -1,3 +1,4 @@
+import csv
 import json
 import logging
 import re
@@ -14,6 +15,160 @@ from .matching_engine import process_all_matches
 
 
 logger = logging.getLogger(__name__)
+
+
+_KEY_REPLACEMENT_CSV = Path(__file__).resolve().parent.parent / "config" / "key_replacements.csv"
+_KEY_REPLACEMENT_CACHE: dict[str, dict[str, str]] | None = None
+
+
+def _load_key_replacement_map() -> dict[str, dict[str, str]]:
+    """CSVからキー置換表を読み込み、カテゴリ別マップを返す。"""
+    global _KEY_REPLACEMENT_CACHE
+    if _KEY_REPLACEMENT_CACHE is not None:
+        return _KEY_REPLACEMENT_CACHE
+
+    replacements: dict[str, dict[str, str]] = {
+        "ALL": {},
+        "人材": {},
+        "案件": {},
+    }
+
+    if not _KEY_REPLACEMENT_CSV.exists():
+        logger.info("Key replacement CSV not found: path=%s", _KEY_REPLACEMENT_CSV)
+        _KEY_REPLACEMENT_CACHE = replacements
+        return _KEY_REPLACEMENT_CACHE
+
+    with _KEY_REPLACEMENT_CSV.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        required = {"category", "from_key", "to_key"}
+        if not required.issubset(set(reader.fieldnames or [])):
+            logger.warning(
+                "Invalid key replacement CSV header: required=%s, actual=%s",
+                sorted(required),
+                reader.fieldnames,
+            )
+            _KEY_REPLACEMENT_CACHE = replacements
+            return _KEY_REPLACEMENT_CACHE
+
+        for row_no, row in enumerate(reader, start=2):
+            category = (row.get("category") or "").strip()
+            from_key = (row.get("from_key") or "").strip()
+            to_key = (row.get("to_key") or "").strip()
+
+            if not category and not from_key and not to_key:
+                continue
+            if category not in replacements:
+                logger.warning(
+                    "Unknown replacement category: row=%s, category=%s",
+                    row_no,
+                    category,
+                )
+                continue
+            if not from_key or not to_key:
+                logger.warning(
+                    "Invalid replacement row: row=%s, from_key=%s, to_key=%s",
+                    row_no,
+                    from_key,
+                    to_key,
+                )
+                continue
+            if from_key == to_key:
+                continue
+
+            replacements[category][from_key] = to_key
+
+    _KEY_REPLACEMENT_CACHE = replacements
+    return _KEY_REPLACEMENT_CACHE
+
+
+def _resolve_key_replacements_for_category(category: str) -> dict[str, str]:
+    """カテゴリに対応する置換ルール（ALL + category）を返す。"""
+    replacement_map = _load_key_replacement_map()
+    merged = dict(replacement_map.get("ALL", {}))
+    merged.update(replacement_map.get(category, {}))
+    return merged
+
+
+def _apply_key_replacements(
+    properties: dict[str, Any],
+    category: str,
+) -> tuple[dict[str, Any], list[tuple[str, str]], list[tuple[str, str]]]:
+    """抽出プロパティのキー置換を行う。衝突時は既存キーを優先する。"""
+    rules = _resolve_key_replacements_for_category(category)
+    if not rules:
+        return properties, [], []
+
+    source_keys = {str(key) for key in properties.keys()}
+    replaced_items: list[tuple[str, str]] = []
+    collisions: list[tuple[str, str]] = []
+    normalized: dict[str, Any] = {}
+
+    for key, value in properties.items():
+        source_key = str(key)
+        target_key = rules.get(source_key, source_key)
+
+        if target_key != source_key:
+            # 置換先キーが元データに存在する場合は既存キーを優先し、置換元は採用しない。
+            if target_key in source_keys:
+                collisions.append((source_key, target_key))
+                continue
+            if target_key in normalized:
+                collisions.append((source_key, target_key))
+                continue
+            normalized[target_key] = value
+            replaced_items.append((source_key, target_key))
+            continue
+
+        if source_key in normalized:
+            continue
+        normalized[source_key] = value
+
+    return normalized, replaced_items, collisions
+
+
+def _apply_key_replacements_after_lm(
+    json_text: str,
+    properties: dict[str, Any],
+    category: str,
+    table_name: str,
+    record_id: int,
+) -> tuple[str, dict[str, Any]]:
+    """LLM取得後にキー置換を適用し、json_text と properties を整合させる。"""
+    normalized_properties, replaced_items, collisions = _apply_key_replacements(properties, category)
+
+    if replaced_items:
+        logger.info(
+            "Key replacements applied: table=%s, id=%s, category=%s, count=%s",
+            table_name,
+            record_id,
+            category,
+            len(replaced_items),
+        )
+    if collisions:
+        logger.warning(
+            "Key replacement collisions skipped (existing key prioritized): table=%s, id=%s, category=%s, collisions=%s",
+            table_name,
+            record_id,
+            category,
+            sorted(set(collisions)),
+        )
+
+    if normalized_properties is properties:
+        return json_text, properties
+
+    try:
+        parsed_json = json.loads(json_text)
+    except json.JSONDecodeError:
+        return json.dumps(normalized_properties, ensure_ascii=False), normalized_properties
+
+    if isinstance(parsed_json, dict):
+        return json.dumps(normalized_properties, ensure_ascii=False), normalized_properties
+
+    if isinstance(parsed_json, list) and parsed_json and isinstance(parsed_json[0], dict):
+        parsed_json[0] = normalized_properties
+        return json.dumps(parsed_json, ensure_ascii=False), normalized_properties
+
+    return json_text, normalized_properties
 
 
 def _sanitize_text_for_lm_request(text: str) -> str:
@@ -1030,23 +1185,32 @@ def _call_lmstudio(
     body_text: str,
     category: str,
     timeout: int = 60,
-    max_tokens: int = 2048,
+    max_tokens: int = 8192,
+    signature_trim_chars: int = 300,
+    greeting_trim_chars: int = 100,
 ) -> str:
     """LM Studio に本文を送り、JSON文字列を返します。"""
     if category == "案件":
         case_schema_text = _load_case_schema_text()
         system_content = (
-            "あなたはIT/SES営業メールの案件から情報を抽出するシステムです\n"
-            "必ずJSONスキーマに従って出力してください。\n"
+            "IT/SES営業メールの人材から情報をJSON抽出器\n"
+            "必ずJSONスキーマに従い未記載の項目は必ず null または [] にする\n"
+            "日本語で作成する\n"
+            "【重要】思考過程や挨拶、分析プロセスは一切不要\n"
             "以下のJSONスキーマに従う\n"
+
             f"{case_schema_text}"
         )
     elif category == "人材":
         human_schema_text = _load_human_schema_text()
         system_content = (
-            "あなたはIT/SES営業メールの人材から情報を抽出するシステムです\n"
+            "IT/SES営業メールの人材から情報をJSON抽出器\n"
             "必ずJSONスキーマに従って出力してください。\n"
+            "未記載の項目は必ず null または [] にする。\n"
+            "日本語で作成する。\n"
+            "【重要】思考過程や挨拶、分析プロセスは一切不要\n"
             "以下のJSONスキーマに従う\n"
+            
             f"{human_schema_text}"
         )
     else:
@@ -1056,72 +1220,27 @@ def _call_lmstudio(
     body_text = _strip_problematic_unicode(body_text)
     # UTF-8 encode→decode で残留不正バイトを確実に除去（LM Studio parse 400 対策）
     body_text = body_text.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
+    # 挨拶除去：先頭 greeting_trim_chars 文字を削除する
+    if greeting_trim_chars > 0:
+        body_text = body_text[greeting_trim_chars:]
+    # 署名除去：末尾 signature_trim_chars 文字を削除する
+    if signature_trim_chars > 0 and len(body_text) > signature_trim_chars:
+        body_text = body_text[:-signature_trim_chars]
     system_content = _sanitize_text_for_lm_request(system_content)
     system_content = _strip_problematic_unicode(system_content)
 
     prompt = (
-        f"以下は{category}メール本文です。解析して必ずJSONのみを返してください。"
-        "未記載の項目は必ず null または [] にする。\n"
-        "日本語で作成する。\n"
-        "説明文やコードブロックは不要です。\n\n"
         f"本文:\n{body_text}"
-    )
-
-    compact_system_content = (
-        "あなたはJSON抽出器です。"
-        "必ずJSONのみ返してください。"
-        "説明文・コードブロックは禁止。"
-    )
-    compact_prompt_2500 = (
-        f"{category}メール本文から項目を抽出し、JSONのみ返してください。\n"
-        "未記載は null または []。\n\n"
-        f"本文:\n{body_text[:1500]}"
-    )
-    compact_prompt_1200 = (
-        f"{category}メール本文から項目を抽出し、JSONのみ返してください。\n"
-        "未記載は null または []。\n\n"
-        f"本文:\n{body_text[:1200]}"
-    )
-    compact_prompt_600 = (
-        f"{category}メール本文から項目を抽出し、JSONのみ返してください。\n"
-        "未記載は null または []。\n\n"
-        f"本文:\n{body_text[:600]}"
-    )
-    ultra_safe_body_text = _strip_problematic_unicode(body_text)
-    compact_prompt_300_safe = (
-        f"{category}メール本文から項目を抽出し、JSONのみ返してください。\n"
-        "未記載は null または []。\n\n"
-        f"本文:\n{ultra_safe_body_text[:300]}"
-    )
-    # 一部のサーバー実装で本文先頭が JSON 断片だと parse input 400 を返すことがあるため、
-    # 最終手段として波括弧を中立化した本文も用意する。
-    ultra_safe_neutralized_body_text = ultra_safe_body_text.replace("{", "（").replace("}", "）")
-    compact_prompt_300_neutralized = (
-        f"{category}メール本文から項目を抽出し、JSONのみ返してください。\n"
-        "未記載は null または []。\n\n"
-        f"本文:\n{ultra_safe_neutralized_body_text[:300]}"
     )
 
     request_variants: list[tuple[str, str]] = []
 
-    # system プロンプト（スキーマ全文）が長すぎると n_keep 超過を起こすため、
-    # 長文時は初回から軽量 system 指示を利用する。
-    use_heavy_system_prompt = len(system_content) <= 2000
-    primary_system_content = system_content if use_heavy_system_prompt else compact_system_content
-
-    request_variants.append((primary_system_content, prompt))
+    request_variants.append((system_content, prompt))
 
     shortened_prompt = prompt[:12000]
     if shortened_prompt != prompt:
         # 長文ケース向けの短縮版
-        request_variants.append((primary_system_content, shortened_prompt))
-
-    # 400 parse input 向けの軽量フォールバック（常に最後に用意）
-    request_variants.append((compact_system_content, compact_prompt_2500))
-    request_variants.append((compact_system_content, compact_prompt_1200))
-    request_variants.append((compact_system_content, compact_prompt_600))
-    request_variants.append((compact_system_content, compact_prompt_300_safe))
-    request_variants.append((compact_system_content, compact_prompt_300_neutralized))
+        request_variants.append((system_content, shortened_prompt))
 
     resp: requests.Response | None = None
     last_http_error: requests.HTTPError | None = None
@@ -1133,8 +1252,10 @@ def _call_lmstudio(
                 {"role": "system", "content": system_variant},
                 {"role": "user", "content": prompt_variant},
             ],
-            "temperature": 0.0,
+            # "temperature": 0.3,
+            # "presence_penalty": 0.1,
             "max_tokens": max_tokens,
+            # "response_format": { "type": "json_object" }
         }
 
         resp = requests.post(endpoint, json=payload, timeout=timeout)
@@ -1221,7 +1342,6 @@ def _call_lmstudio(
         repaired = _sanitize_json_like_content(content)
         try:
             parsed = json.loads(repaired)
-            logger.warning("JSON parse repaired by sanitizer")
         except json.JSONDecodeError as repaired_error:
             logger.warning(
                 "JSON parse failed (sanitized), applying fallback: content=%s, error=%s",
@@ -1244,6 +1364,8 @@ def _process_single_record_for_lm(
     category: str,
     timeout: int,
     max_tokens: int,
+    signature_trim_chars: int = 300,
+    greeting_trim_chars: int = 100,
 ) -> tuple[str, dict[str, Any]]:
     """単一レコードのLM問い合わせ結果を返す（DB更新は行わない）。"""
     attempt_max_tokens = max(1, int(max_tokens))
@@ -1257,6 +1379,8 @@ def _process_single_record_for_lm(
                 category=category,
                 timeout=timeout,
                 max_tokens=attempt_max_tokens,
+                signature_trim_chars=signature_trim_chars,
+                greeting_trim_chars=greeting_trim_chars,
             )
             break
         except RuntimeError as e:
@@ -1304,6 +1428,8 @@ def process_pending_records_with_lmstudio(
     enabled_tables: list[str] | None = None,
     run_matching: bool = True,
     max_workers: int = 1,
+    signature_trim_chars: int = 300,
+    greeting_trim_chars: int = 100,
 ) -> tuple[int, int]:
     """status='0' のレコードを LM Studio でJSON化して保存します。"""
     total_success = 0
@@ -1354,6 +1480,8 @@ def process_pending_records_with_lmstudio(
                     category,
                     timeout,
                     max_tokens,
+                    signature_trim_chars,
+                    greeting_trim_chars,
                 )
                 futures[future] = record_id
                 logger.debug(f"LM処理を投入: table={table_name}, id={record_id}")
@@ -1363,6 +1491,13 @@ def process_pending_records_with_lmstudio(
                 processed_count += 1
                 try:
                     json_text, first_obj = future.result()
+                    json_text, first_obj = _apply_key_replacements_after_lm(
+                        json_text=json_text,
+                        properties=first_obj,
+                        category=category,
+                        table_name=table_name,
+                        record_id=record_id,
+                    )
                     update_record_json_status_and_properties(
                         conn=conn,
                         table_name=table_name,

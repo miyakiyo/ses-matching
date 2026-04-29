@@ -200,7 +200,30 @@ def _match_constraints(talent_record: dict, project_record: dict) -> Tuple[bool,
             details["freelance"] = "talent_employee_ok"
     else:
         details["freelance"] = "project_no_restriction"
+
+    # 商流制限_貴社所属迄チェック
+    # True の場合、人材の所属が弊社直接雇用（「弊社」「直」を含む）である必要がある
+    project_direct_only = project_record.get("商流制限_貴社所属迄", False)
+    if project_direct_only:
+        talent_belonging = talent_record.get("所属", "").strip()
+        is_direct = any(kw in talent_belonging for kw in ["弊社", "直属", "直雇", "直接"])
+        if not is_direct:
+            constraints_ok = False
+        details["direct_only"] = "match" if is_direct else "talent_not_direct"
+    else:
+        details["direct_only"] = "no_restriction"
+
+    # 派遣案件と1社下所属の不適合チェック
+    # 派遣案件で人材が「1社下所属」の場合は NG
+    contract_type = project_record.get("契約形態", "").strip()
+    talent_belonging = talent_record.get("所属", "").strip()
     
+    if contract_type == "派遣" and "1社下" in talent_belonging:
+        constraints_ok = False
+        details["dispatch_secondment"] = "ng_dispatch_with_secondment"
+    else:
+        details["dispatch_secondment"] = "ok" if contract_type == "派遣" else "not_dispatch"
+
     constraint_score = 25 if constraints_ok else 0
     
     return (constraints_ok, constraint_score, details)
@@ -253,6 +276,81 @@ def _match_location_remote(talent_record: dict, project_record: dict) -> Tuple[b
     return (location_ok, remote_score + location_score, details)
 
 
+def _parse_talent_age(age_val) -> Optional[int]:
+    """人材の年齢値を整数に変換します。
+
+    :param age_val: 年齢（int または str）。
+    :return: 年齢整数。変換不可なら None。
+    """
+    if age_val is None:
+        return None
+    if isinstance(age_val, int):
+        return age_val
+    import re
+    s = str(age_val).strip()
+    # 例: "35" / "35歳"
+    m = re.match(r'^(\d+)', s)
+    if m:
+        return int(m.group(1))
+    # 例: "30代前半" -> 32 / "30代後半" -> 37 / "30代" -> 35
+    m = re.match(r'^(\d+)代(前半|後半)?', s)
+    if m:
+        base = int(m.group(1))
+        suffix = m.group(2)
+        if suffix == '前半':
+            return base + 2
+        if suffix == '後半':
+            return base + 7
+        return base + 5
+    return None
+
+
+def _parse_project_age_limit(age_str: Optional[str]) -> Optional[int]:
+    """案件の年齢制限文字列を数値上限に変換します。
+
+    :param age_str: 年齢文字列（例: 「〜45歳」「45歳まで」「制限なし」）。
+    :return: 上限年齢（制限なしまたは未記載は None）。
+    """
+    if not age_str:
+        return None
+    s = str(age_str).strip()
+    if s in ('制限なし', '不問', '不明', ''):
+        return None
+    import re
+    # 例: 「〜45歳」「45歳まで」「45歳以下」「45迄」「~45」
+    m = re.search(r'(\d+)\s*(?:歳|迄|まで|以下)?', s)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _match_age(talent_record: dict, project_record: dict) -> Tuple[bool, int, dict]:
+    """年齢マッチング判定を実施します（ソフト制約）。
+
+    :param talent_record: 人材レコード辞書。
+    :param project_record: 案件レコード辞書。
+    :return: (True, スコア, 詳細) の3要素タプル。
+    """
+    talent_age = _parse_talent_age(talent_record.get('年齢'))
+    project_limit = _parse_project_age_limit(project_record.get('年齢'))
+
+    # 制限なしまたは人材の年齢不明の場合はデータなしとしてスキップ
+    if project_limit is None or talent_age is None:
+        return (True, 0, {'status': 'unknown_age'})
+
+    within = talent_age <= project_limit
+    score = 15 if within else 0
+    return (
+        True,  # ソフト制約なので常に True
+        score,
+        {
+            'talent_age': talent_age,
+            'project_limit': project_limit,
+            'within_limit': within,
+        },
+    )
+
+
 def calculate_match_score(talent_record: dict, project_record: dict) -> Tuple[int, dict]:
     """人材と案件のマッチングスコアを計算します。
 
@@ -265,6 +363,9 @@ def calculate_match_score(talent_record: dict, project_record: dict) -> Tuple[in
     
     # 1. スキルマッチング
     project_required = _parse_json_array(project_record.get("必須スキル"))
+    # 案件の開発言語・データベース・OS/クラウドも必須スキルに加える
+    for key in ["開発言語", "データベース", "OS/クラウド"]:
+        project_required.extend(_parse_json_array(project_record.get(key)))
     project_preferred = _parse_json_array(project_record.get("尚可スキル"))
     
     skill_match, skill_score, skill_details = _match_skills(
@@ -319,6 +420,18 @@ def calculate_match_score(talent_record: dict, project_record: dict) -> Tuple[in
         "match": location_match,
         "score": location_score,
         "details": location_details,
+    }
+    
+    # 5. 年齢
+    age_match, age_score, age_details = _match_age(
+        talent_record,
+        project_record,
+    )
+    total_score += age_score
+    reason["age"] = {
+        "match": age_match,
+        "score": age_score,
+        "details": age_details,
     }
     
     # スコアを 0-100 に正規化（最大 100 を超えないように）
