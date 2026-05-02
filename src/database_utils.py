@@ -8,6 +8,58 @@ import sqlite3
 
 
 logger = logging.getLogger(__name__)
+JST = timezone(timedelta(hours=9))
+
+# CSV出力時にJST変換する日時カラム。
+CSV_DATETIME_COLUMNS = {
+    "run_at",
+    "created_at",
+    "updated_at",
+    "received_at",
+    "talent_received_at",
+    "project_received_at",
+}
+
+
+def _to_jst_for_csv(value: object) -> object:
+    """UTC系の日時文字列をJST文字列へ変換して返します。
+
+    変換不能な値はそのまま返し、CSV出力を継続します。
+    """
+    if not isinstance(value, str):
+        return value
+
+    text = value.strip()
+    if not text:
+        return value
+
+    # 末尾Zをfromisoformatで扱える+00:00へ正規化する。
+    normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return value
+
+    # tz情報がない値はUTCとして扱う（SQLite CURRENT_TIMESTAMP互換）。
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+
+    jst_dt = parsed.astimezone(JST)
+
+    # ISO系はオフセット付き、スペース区切りは従来互換の見た目で出力する。
+    if "T" in text or text.endswith("Z") or "+" in text:
+        return jst_dt.isoformat(timespec="seconds")
+    return jst_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _convert_row_datetimes_for_csv(column_names: list[str], row: tuple) -> list[object]:
+    """CSV行のうち日時カラムのみJSTへ変換して返します。"""
+    converted = list(row)
+    for idx, column_name in enumerate(column_names):
+        if column_name in CSV_DATETIME_COLUMNS:
+            converted[idx] = _to_jst_for_csv(converted[idx])
+    return converted
 
 
 def init_db(db_path: str = "DB/mails.db") -> sqlite3.Connection:
@@ -262,6 +314,8 @@ def delete_old_records(conn: sqlite3.Connection, days: int = 7) -> tuple:
 def export_tables_to_csv(conn: sqlite3.Connection, output_dir: str = "csv_exports") -> list[str]:
     """各テーブルの内容をCSVファイルへ出力します。
 
+    DB内部値はUTCのまま保持し、CSVでは日時カラムのみJSTに変換して出力します。
+
     :param conn: SQLiteコネクション。
     :param output_dir: CSV出力先ディレクトリ。
     :return: 出力したCSVファイルパス一覧。
@@ -282,7 +336,8 @@ def export_tables_to_csv(conn: sqlite3.Connection, output_dir: str = "csv_export
             writer = csv.writer(csv_file)
             if column_names:
                 writer.writerow(column_names)
-            writer.writerows(rows)
+            for row in rows:
+                writer.writerow(_convert_row_datetimes_for_csv(column_names, row))
 
         exported_files.append(str(csv_path))
 
@@ -310,7 +365,7 @@ def export_tables_to_csv(conn: sqlite3.Connection, output_dir: str = "csv_export
     joined_csv_path = output_path / "matches_joined.csv"
     with joined_csv_path.open("w", newline="", encoding="utf-8-sig") as csv_file:
         writer = csv.writer(csv_file)
-        writer.writerow([
+        joined_columns = [
                 "talent_folder",
                 "talent_subject",
                 "talent_body",
@@ -320,8 +375,10 @@ def export_tables_to_csv(conn: sqlite3.Connection, output_dir: str = "csv_export
                 "project_body",
                 "project_received_at",
                 "score",
-        ])
-        writer.writerows(joined_rows)
+        ]
+        writer.writerow(joined_columns)
+        for row in joined_rows:
+            writer.writerow(_convert_row_datetimes_for_csv(joined_columns, row))
 
     exported_files.append(str(joined_csv_path))
 
