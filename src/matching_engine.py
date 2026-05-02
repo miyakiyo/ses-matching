@@ -229,51 +229,7 @@ def _match_constraints(talent_record: dict, project_record: dict) -> Tuple[bool,
     return (constraints_ok, constraint_score, details)
 
 
-def _match_location_remote(talent_record: dict, project_record: dict) -> Tuple[bool, int, dict]:
-    """地域・リモートマッチング判定を実施します。
 
-    :param talent_record: 人材レコード辞書。
-    :param project_record: 案件レコード辞書。
-    :return: (マッチ判定, スコア加点, 詳細情報) の3要素タプル。
-    """
-    location_ok = True
-    details = {}
-    
-    # リモート頻度チェック
-    talent_remote = talent_record.get("リモート頻度", "").strip()
-    project_remote = project_record.get("リモート頻度", "").strip()
-    
-    remote_score = 0
-    if talent_remote and project_remote:
-        # 両者の値が同じか、人材が「フルリモート」なら OK
-        if talent_remote == project_remote or talent_remote == "フルリモート":
-            remote_score = 13  # リモート頻度が合致で 13 点（オプショナル）
-            details["remote"] = "match"
-        else:
-            details["remote"] = "no_match"
-    else:
-        details["remote"] = "no_data"
-    
-    # 最寄駅 / 作業場所チェック（単純な存在確認）
-    talent_station = talent_record.get("最寄駅", "").strip()
-    project_location = project_record.get("作業場所", "").strip()
-    
-    location_score = 0
-    if talent_station and project_location:
-        # 近いかどうかの判定は正確な緯度経度マッピングが必要なので、
-        # ここでは両方存在するだけで OK とする
-        location_score = 12  # 位置情報が存在で 12 点
-        details["location"] = "both_exist"
-    elif not project_location:
-        # リモート案件の可能性が高い
-        location_score = 12
-        details["location"] = "project_no_fixed_location"
-    else:
-        details["location"] = "uncertain"
-    
-    location_ok = True  # 地域・リモートは「条件をはずす」判定ではなく、スコアのみ影響
-    
-    return (location_ok, remote_score + location_score, details)
 
 
 def _parse_talent_age(age_val) -> Optional[int]:
@@ -410,19 +366,7 @@ def calculate_match_score(talent_record: dict, project_record: dict) -> Tuple[in
         "details": constraint_details,
     }
     
-    # 4. 地域・リモート
-    location_match, location_score, location_details = _match_location_remote(
-        talent_record,
-        project_record,
-    )
-    total_score += location_score
-    reason["location_remote"] = {
-        "match": location_match,
-        "score": location_score,
-        "details": location_details,
-    }
-    
-    # 5. 年齢
+    # 4. 年齢
     age_match, age_score, age_details = _match_age(
         talent_record,
         project_record,

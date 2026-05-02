@@ -24,8 +24,8 @@ processes:
 
 # SES分類キーワード
 ses:
-  project_keywords: [案件, 募集, 急募, 増員, 交代枠]
-  talent_keywords: [人材, 要員, プロパー,技術者, 要員, 弊社所属, エンジニア, 稼働可能, 参画可能, 待機, 空き, フリーランス, 即戦力]
+  project_keywords: [案件, 募集, 急募, 増員, 交代枠, エンド直, 元請直, 現場直, 参画予定, 参画中, 【ARI】]
+  talent_keywords: [人材, 要員, プロパー,技術者, 要員, 弊社所属, エンジニア, 稼働可能, 参画可能, 待機, 空き, フリーランス, 即戦力, 個人事業主, 正社員, 懇意BP, 歳]
   unclassified_log_path: logs/unclassified.log
   log_path: "logs/app.log"
 
