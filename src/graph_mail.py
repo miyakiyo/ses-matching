@@ -98,7 +98,7 @@ def get_mail_subjects(
     not_folder: List[str] = None,
     not_folder_keywords: List[str] = None,
     token_refresher: Callable[[], str] = None,
-) -> List[Tuple[str, str]]:
+) -> tuple[List[Tuple[str, str]], dict[str, int]]:
     """指定期間のメール件名を取得し、分類に応じてDB保存します。
 
     :param user_email: 対象メールボックスのアドレス。
@@ -111,7 +111,7 @@ def get_mail_subjects(
     :param talent_keywords: 人材分類キーワード一覧。
     :param not_folder: 除外フォルダ名一覧（完全一致）。
     :param not_folder_keywords: 除外キーワード一覧（完全一致）。
-    :return: (folder_name, subject) の一覧。
+    :return: ((folder_name, subject) の一覧, 分類別件数辞書)。
     """
 
     # access_tokenがない場合は処理を続行できないため、明示的に例外を投げる。
@@ -163,6 +163,10 @@ def get_mail_subjects(
     not_folder_keywords = not_folder_keywords or []
 
     subjects: List[Tuple[str, str]] = []
+    category_counts = {
+        "project": 0,
+        "talent": 0,
+    }
 
     def fetch_messages_in_folder(folder_id: str, folder_name: str = "") -> None:
         """指定フォルダのメッセージをページング取得して分類保存する。
@@ -224,8 +228,10 @@ def get_mail_subjects(
                         # 分類結果に応じて保存先テーブルを決定する。
                         if category == "人材":
                             table_name = "mails_talent"
+                            category_counts["talent"] += 1
                         elif category == "案件":
                             table_name = "mails_project"
+                            category_counts["project"] += 1
                         else:  # 未分類
                             table_name = "mails_unclassified"
 
@@ -326,7 +332,7 @@ def get_mail_subjects(
         except Exception as error:
             logger.error(f"Error while recursing folder {folder_name} {folder_id}: {error}")
 
-    return subjects
+    return subjects, category_counts
 
 
 def delete_mails_before_date(

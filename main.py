@@ -36,6 +36,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+RESULT_COUNTS_LOG_PATH = 'logs/result_counts.log'
+
+
+def _build_result_counts_logger() -> logging.Logger:
+    """結果件数専用ロガーを構築して返します。"""
+    result_logger = logging.getLogger('result_counts')
+    result_logger.setLevel(logging.INFO)
+    result_logger.propagate = False
+    if result_logger.handlers:
+        return result_logger
+
+    result_log_dir = Path(RESULT_COUNTS_LOG_PATH).parent
+    result_log_dir.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(RESULT_COUNTS_LOG_PATH, encoding='utf-8')
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+    result_logger.addHandler(file_handler)
+    return result_logger
+
+
+def _log_result_counts(result_logger: logging.Logger, message: str) -> None:
+    """結果件数ログを1行出力します。"""
+    result_logger.info(message)
+
 NOT_FOLDER = config.get('mailbox', {}).get('not_folder', [])
 NOT_FOLDER_KEYWORDS = config.get('mailbox', {}).get('not_folder_keywords', [])
 LM_EXCLUDE_FOLDERS_TALENT = config.get('mailbox', {}).get('lm_exclude_folders_talent', [])
@@ -218,7 +241,7 @@ def _acquire_access_token() -> str:
     return access_token
 
 
-def _run_mail_fetch(conn, access_token: str) -> datetime:
+def _run_mail_fetch(conn, access_token: str) -> tuple[datetime, int, int]:
     """メール取得と分類保存を実行します。"""
     mailbox = config.get('mailbox', {}).get('shared_mailbox', '*****@offgrid.co.jp')
     last_run_at = get_last_run_at(conn)
@@ -237,7 +260,7 @@ def _run_mail_fetch(conn, access_token: str) -> datetime:
 
     project_keywords = config.get('ses', {}).get('project_keywords', ['案件', '募集'])
     talent_keywords = config.get('ses', {}).get('talent_keywords', ['人材', '要員'])
-    titles = get_mail_subjects(
+    titles, mail_counts = get_mail_subjects(
         mailbox,
         start,
         end,
@@ -258,14 +281,14 @@ def _run_mail_fetch(conn, access_token: str) -> datetime:
             append_unclassified_log(unclassified_log_path, folder, subject)
             logger.info(str((folder, subject, category)))
 
-    return end
+    return end, mail_counts.get('project', 0), mail_counts.get('talent', 0)
 
 
-def _run_lm_postprocess(conn, run_talent: bool = True, run_project: bool = True) -> None:
+def _run_lm_postprocess(conn, run_talent: bool = True, run_project: bool = True) -> tuple[int, int, int, int]:
     """LM後処理を実行します。"""
     if not run_talent and not run_project:
         logger.info('LM後処理は設定によりスキップされました。')
-        return
+        return 0, 0, 0, 0
 
     lmstudio_endpoint = config.get('lmstudio', {}).get('endpoint', 'http://localhost:1234/v1/chat/completions')
     lmstudio_model = config.get('lmstudio', {}).get('model', 'Qwen2.5-7B-Instruct-GGUF')
@@ -286,7 +309,7 @@ def _run_lm_postprocess(conn, run_talent: bool = True, run_project: bool = True)
     if run_project:
         enabled_tables.append('mails_project')
 
-    lm_success, lm_error = process_pending_records_with_lmstudio(
+    lm_success, lm_error, lm_success_talent, lm_success_project = process_pending_records_with_lmstudio(
         conn=conn,
         endpoint=lmstudio_endpoint,
         model=lmstudio_model,
@@ -305,12 +328,14 @@ def _run_lm_postprocess(conn, run_talent: bool = True, run_project: bool = True)
         interval_rest_seconds=lmstudio_interval_rest_seconds,
     )
     logger.info(f'LM後処理結果: success={lm_success}, error={lm_error}')
+    return lm_success, lm_error, lm_success_talent, lm_success_project
 
 
-def _run_delete_old_records(conn) -> None:
+def _run_delete_old_records(conn) -> tuple[int, int, int]:
     """古いレコード削除を実行します。"""
     deleted_talent, deleted_project, deleted_history = delete_old_records(conn, days=7)
     logger.info(f'削除完了: mails_talent={deleted_talent}件, mails_project={deleted_project}件, run_history={deleted_history}件')
+    return deleted_talent, deleted_project, deleted_history
 
 
 def _run_csv_export(conn) -> None:
@@ -321,7 +346,7 @@ def _run_csv_export(conn) -> None:
         logger.info(f'CSV出力完了: {exported_file}')
 
 
-def _run_matching_only(conn) -> None:
+def _run_matching_only(conn) -> dict[str, int]:
     """マッチング処理のみを実行します。"""
     from src.matching_engine import process_all_matches
     
@@ -332,6 +357,7 @@ def _run_matching_only(conn) -> None:
             f'マッチング処理完了: total={match_stats["total_matches"]}, '
             f'added={match_stats["added"]}, updated={match_stats["updated"]}'
         )
+        return match_stats
     except Exception as e:
         logger.error(f'マッチング処理失敗: {e}')
         raise
@@ -345,6 +371,7 @@ if __name__ == '__main__':
 
     db_path = config.get('mailbox', {}).get('db_path', 'DB/mails.db')
     conn = init_db(db_path)
+    result_counts_logger = _build_result_counts_logger()
 
     try:
         logger.info(f'実行モード: {mode}')
@@ -352,32 +379,81 @@ if __name__ == '__main__':
         end = None
 
         if process_plan['mail_fetch']:
-            access_token = _acquire_access_token()
-            end = _run_mail_fetch(conn, access_token)
+            try:
+                access_token = _acquire_access_token()
+                end, mail_project_count, mail_talent_count = _run_mail_fetch(conn, access_token)
+                _log_result_counts(
+                    result_counts_logger,
+                    f'process=mail status=success mail_project={mail_project_count} mail_talent={mail_talent_count}',
+                )
+            except Exception as e:
+                _log_result_counts(
+                    result_counts_logger,
+                    f'process=mail status=failed error={str(e).replace(" ", "_")}',
+                )
+                raise
         else:
             logger.info('メール取得は設定によりスキップされました。')
+            _log_result_counts(result_counts_logger, 'process=mail status=skipped')
 
         if process_plan['lm_postprocess_talent'] or process_plan['lm_postprocess_project']:
-            _run_lm_postprocess(
-                conn,
-                run_talent=process_plan['lm_postprocess_talent'],
-                run_project=process_plan['lm_postprocess_project'],
-            )
+            try:
+                lm_success, lm_error, lm_talent_count, lm_project_count = _run_lm_postprocess(
+                    conn,
+                    run_talent=process_plan['lm_postprocess_talent'],
+                    run_project=process_plan['lm_postprocess_project'],
+                )
+                _log_result_counts(
+                    result_counts_logger,
+                    f'process=lm status=success lm_project={lm_project_count} lm_talent={lm_talent_count} lm_success={lm_success} lm_error={lm_error}',
+                )
+            except Exception as e:
+                _log_result_counts(
+                    result_counts_logger,
+                    f'process=lm status=failed error={str(e).replace(" ", "_")}',
+                )
+                raise
         else:
             logger.info('LM後処理は設定によりスキップされました。')
+            _log_result_counts(result_counts_logger, 'process=lm status=skipped')
 
         if process_plan['matching']:
-            _run_matching_only(conn)
+            try:
+                match_stats = _run_matching_only(conn)
+                _log_result_counts(
+                    result_counts_logger,
+                    f'process=matching status=success matching_total={match_stats["total_matches"]} matching_added={match_stats["added"]} matching_updated={match_stats["updated"]}',
+                )
+            except Exception as e:
+                _log_result_counts(
+                    result_counts_logger,
+                    f'process=matching status=failed error={str(e).replace(" ", "_")}',
+                )
+                raise
         else:
             logger.info('マッチング処理は設定によりスキップされました。')
+            _log_result_counts(result_counts_logger, 'process=matching status=skipped')
 
         if end is not None:
             record_run_at(conn, end)
 
         if process_plan['delete_old']:
-            _run_delete_old_records(conn)
+            try:
+                deleted_talent, deleted_project, deleted_history = _run_delete_old_records(conn)
+                delete_total = deleted_talent + deleted_project
+                _log_result_counts(
+                    result_counts_logger,
+                    f'process=delete status=success delete_total={delete_total} delete_talent={deleted_talent} delete_project={deleted_project} delete_history={deleted_history}',
+                )
+            except Exception as e:
+                _log_result_counts(
+                    result_counts_logger,
+                    f'process=delete status=failed error={str(e).replace(" ", "_")}',
+                )
+                raise
         else:
             logger.info('古いレコード削除は設定によりスキップされました。')
+            _log_result_counts(result_counts_logger, 'process=delete status=skipped')
 
         if process_plan['csv_export']:
             _run_csv_export(conn)

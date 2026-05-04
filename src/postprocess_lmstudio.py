@@ -1434,10 +1434,12 @@ def process_pending_records_with_lmstudio(
     greeting_trim_chars: int = 100,
     interval_work_seconds: int = 0,
     interval_rest_seconds: int = 30,
-) -> tuple[int, int]:
+) -> tuple[int, int, int, int]:
     """status='0' のレコードを LM Studio でJSON化して保存します。"""
     total_success = 0
     total_error = 0
+    success_talent = 0
+    success_project = 0
     normalized_workers = max(1, int(max_workers))
     use_interval = interval_work_seconds > 0 and interval_rest_seconds > 0
     interval_start_time = time.monotonic()
@@ -1523,6 +1525,10 @@ def process_pending_records_with_lmstudio(
                             status="1",
                         )
                         total_success += 1
+                        if table_name == "mails_talent":
+                            success_talent += 1
+                        else:
+                            success_project += 1
                         logger.info(
                             f"LM処理成功: table={table_name}, id={record_id}, progress={processed_count}/{len(record_list)}"
                         )
@@ -1556,4 +1562,4 @@ def process_pending_records_with_lmstudio(
         except Exception as e:
             logger.error(f"マッチング処理失敗: {e}")
     
-    return total_success, total_error
+    return total_success, total_error, success_talent, success_project

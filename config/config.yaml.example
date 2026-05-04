@@ -1,44 +1,44 @@
 # Azure AD認証情報
 azure:
-  client_id: *****************
-  client_secret: *****************
-  tenant_id: *****************
+  client_id: *****************  # Azure AD アプリのクライアントID
+  client_secret: *****************  # Azure AD アプリのクライアントシークレット
+  tenant_id: *****************  # Azure AD テナントID
 
 # メールボックス情報
 mailbox:
-  shared_mailbox: sales@offgrid.co.jp
+  shared_mailbox: sales@offgrid.co.jp  # 処理対象の共有メールボックスアドレス
   not_folder: []  # 除外フォルダリスト（例: [Documents, Archive]）
   not_folder_keywords: [迷惑メール, 送信トレイ, 送信済みアイテム, 削除済みアイテム, 三松システムコンサルティング, レンサ, ラグナロク, ユーフォノーツ, マイラップ, ブライトスター, ドリームビジョン, テックリーチ, クロニクル, グラントホープ, キャリアビート, エンジニアのミカタ, エル・フィールド, イチアール]  # フォルダ名が完全一致したら除外（例: ["削除済みアイテム", "通知"]）
   lm_exclude_folders_talent: [三松システムコンサルティング, レンサ, ラグナロク, ユーフォノーツ, マイラップ, ブライトスター, ドリームビジョン, テックリーチ, クロニクル, グラントホープ, キャリアビート, エンジニアのミカタ, エル・フィールド, イチアール]  # LM後処理(人材)の対象から除外するフォルダ名（完全一致）
   lm_exclude_folders_project: [三松システムコンサルティング, レンサ, ラグナロク, ユーフォノーツ, マイラップ, ブライトスター, ドリームビジョン, テックリーチ, クロニクル, グラントホープ, キャリアビート, エンジニアのミカタ, エル・フィールド, イチアール]  # LM後処理(案件)の対象から除外するフォルダ名（完全一致）
-  db_path: DB/mails.db
+  db_path: DB/mails.db  # SQLite データベースファイルのパス
 
 # 処理実行フラグ（CLI未指定時に適用、CLI指定時はCLIを優先）
 processes:
-  mail_fetch: true
-  lm_postprocess_talent: true
-  lm_postprocess_project: true
-  matching: true
-  delete_old: true
-  csv_export: true
+  mail_fetch: true  # メール取得を実行するか
+  lm_postprocess_talent: true  # LM後処理（人材）を実行するか
+  lm_postprocess_project: true  # LM後処理（案件）を実行するか
+  matching: true  # マッチング処理を実行するか
+  delete_old: true  # 古いレコード削除を実行するか
+  csv_export: true  # CSV出力を実行するか
 
 # SES分類キーワード
 ses:
-  project_keywords: [案件, 募集, 急募, 増員, 交代枠, エンド直, 元請直, 現場直, 参画予定, 参画中, 【ARI】]
-  talent_keywords: [人材, 要員, プロパー,技術者, 要員, 弊社所属, エンジニア, 稼働可能, 参画可能, 待機, 空き, フリーランス, 即戦力, 個人事業主, 正社員, 懇意BP, 歳]
-  unclassified_log_path: logs/unclassified.log
-  log_path: "logs/app.log"
+  project_keywords: [案件, 募集, 急募, 増員, 交代枠, エンド直, 元請直, 現場直, 参画予定, 参画中, 【ARI】]  # 案件判定に使うキーワード
+  talent_keywords: [人材, 要員, プロパー,技術者, 要員, 弊社所属, エンジニア, 稼働可能, 参画可能, 待機, 空き, フリーランス, 即戦力, 個人事業主, 正社員, 懇意BP, 歳]  # 人材判定に使うキーワード
+  unclassified_log_path: logs/unclassified.log  # 未分類メールのログ出力先
+  log_path: "logs/app.log"  # アプリケーションログの出力先
 
 # LM Studio 設定
 lmstudio:
-  endpoint: http://localhost:1234/v1/chat/completions
-  model: Qwen2.5-7B-Instruct-GGUF
-  timeout: 60
-  max_tokens: 4096
-  limit_per_table_talent: 500
-  limit_per_table_project: 500
-  num_workers: 4
-  signature_trim_chars: 300
-  greeting_trim_chars: 100
+  endpoint: http://localhost:1234/v1/chat/completions  # LM Studio API エンドポイント
+  model: Qwen2.5-7B-Instruct-GGUF  # 使用するモデル名
+  timeout: 60  # リクエストタイムアウト秒数
+  max_tokens: 4096  # 生成トークン上限
+  limit_per_table_talent: 500  # 人材テーブルの1回あたり処理件数上限
+  limit_per_table_project: 500  # 案件テーブルの1回あたり処理件数上限
+  num_workers: 4  # 並列実行ワーカー数
+  signature_trim_chars: 300  # 本文末尾で署名として削る文字数
+  greeting_trim_chars: 100  # 本文先頭で挨拶として削る文字数
   interval_work_seconds: 180  # この秒数連続稼働したらインターバルを挿入（0で無効）
   interval_rest_seconds: 30   # インターバルの休止秒数
