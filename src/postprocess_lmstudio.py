@@ -127,6 +127,58 @@ def _apply_key_replacements(
     return normalized, replaced_items, collisions
 
 
+def _normalize_skill_list_value(value: Any) -> list[str]:
+    """スキル系フィールド値を文字列リストへ正規化します。"""
+    if value is None:
+        return []
+
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    text = str(value).strip()
+    if not text:
+        return []
+
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    parts = re.split(r"[、,，/／・;]+", text)
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _backfill_project_fields_from_required_skills(properties: dict[str, Any]) -> dict[str, Any]:
+    """案件データで必須スキルを関連フィールドへ補完します。"""
+    required_skills = _normalize_skill_list_value(properties.get("必須スキル"))
+    if not required_skills:
+        return properties
+
+    # 担当/工程はLLMが必須スキルから意味的に抽出するため、ここでは補完しない。
+    # 開発言語/データベース/OS/クラウドのみ必須スキルから補完する。
+    target_fields = ["開発言語", "データベース", "OS/クラウド"]
+    normalized = dict(properties)
+
+    for field_name in target_fields:
+        current_values = _normalize_skill_list_value(normalized.get(field_name))
+        merged_values: list[str] = []
+        seen: set[str] = set()
+
+        for value in current_values + required_skills:
+            key = value.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged_values.append(value)
+
+        normalized[field_name] = merged_values
+
+    return normalized
+
+
 def _apply_key_replacements_after_lm(
     json_text: str,
     properties: dict[str, Any],
@@ -136,6 +188,8 @@ def _apply_key_replacements_after_lm(
 ) -> tuple[str, dict[str, Any]]:
     """LLM取得後にキー置換を適用し、json_text と properties を整合させる。"""
     normalized_properties, replaced_items, collisions = _apply_key_replacements(properties, category)
+    if category == "案件":
+        normalized_properties = _backfill_project_fields_from_required_skills(normalized_properties)
 
     if replaced_items:
         logger.info(

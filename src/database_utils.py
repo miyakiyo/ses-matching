@@ -164,12 +164,15 @@ def init_db(db_path: str = "DB/mails.db") -> sqlite3.Connection:
             "求める人物像" TEXT,
             "時期"      TEXT,
             "契約期間"  TEXT,
-            "単価"      TEXT,
+            "単価下限"  REAL,
+            "単価上限"  REAL,
             "稼働率"    TEXT,
             "精算"      TEXT,
             "面談"      TEXT,
             "募集人数"  TEXT,
             "年齢"      TEXT,
+            "年齢下限"  INTEGER,
+            "年齢上限"  INTEGER,
             "外国籍可否" TEXT,
             "個人事業主可否" TEXT,
             "契約形態"  TEXT,
@@ -227,6 +230,20 @@ def init_db(db_path: str = "DB/mails.db") -> sqlite3.Connection:
         )
         """
     )
+
+    # 既存DBに年齢下限/上限カラムが無い場合は追加する。
+    project_columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(mails_project)").fetchall()
+    }
+    if "単価下限" not in project_columns:
+        conn.execute('ALTER TABLE mails_project ADD COLUMN "単価下限" REAL')
+    if "単価上限" not in project_columns:
+        conn.execute('ALTER TABLE mails_project ADD COLUMN "単価上限" REAL')
+    if "年齢下限" not in project_columns:
+        conn.execute('ALTER TABLE mails_project ADD COLUMN "年齢下限" INTEGER')
+    if "年齢上限" not in project_columns:
+        conn.execute('ALTER TABLE mails_project ADD COLUMN "年齢上限" INTEGER')
 
     conn.commit()
     return conn

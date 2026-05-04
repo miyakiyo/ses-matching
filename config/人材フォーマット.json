@@ -11,18 +11,10 @@
         "enum": ["人材"]
       },
       "年齢": {
-        "oneOf": [
-          {
-            "type": "integer",
-            "minimum": 0,
-            "maximum": 120
-          },
-            {
-              "type": "string",
-              "description": "数値以外の表現も許容（例: 20代後半）"
-            }
-        ],
-        "description": "整数または文字列表記"
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 120,
+        "description": "年齢（整数のみ）"
       },
       "所属": {
         "type": "string",
@@ -37,35 +29,23 @@
         "description": "true=個人事業主 / false=法人所属"
       },
       "希望単価": {
-        "oneOf": [
-          {
-            "type": "number",
-            "minimum": 0,
-            "description": "例: 90 (単位=万円)"
-          },
-          {
-            "type": "string",
-            "pattern": "^[0-9]+(-[0-9]+)?万?円?$",
-            "description": "例: 80-100, 90万, 90万円"
-          }
-        ],
-        "description": "希望単価（数値または範囲）"
-      },
-      "稼働可能日": {
-        "type": "string",
-        "description": "稼働開始可能日（例: 即日/翌月/2025-10-01）"
+        "type": "number",
+        "minimum": 0,
+        "description": "希望単価（数値のみ。単位=万円）"
       },
       "リモート頻度": {
         "type": "string",
         "description": "例: フルリモート/週2出社 など"
       },
       "担当": {
-        "type": "string",
-        "description": "想定ロール（例: メンバー/リーダー/SE/PG）"
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "想定ロール（例: [メンバー, リーダー, SE, PG]）"
       },
       "工程": {
-        "type": "string",
-        "description": "例: 要件定義/基本設計/詳細設計/開発/テスト/運用保守"
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "例: [要件定義, 基本設計, 詳細設計, 開発, テスト, 運用保守]"
       },
       "開発言語": {
         "type": "array",

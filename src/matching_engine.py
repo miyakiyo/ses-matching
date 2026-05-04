@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import re
 from typing import Optional, Tuple
 from .database_utils import (
     get_talent_record,
@@ -9,23 +10,38 @@ from .database_utils import (
 )
 
 
-def _parse_json_array(field: Optional[str]) -> list:
-    """JSON配列文字列をPython listに変換します。
-
-    :param field: JSON配列文字列（例: "[\"Java\", \"Python\"]"）。
-    :return: 変換後のリスト。パースに失敗した場合は空リスト。
-    """
-    if not field:
+def _normalize_list_value(field, split_plain_text: bool = True) -> list[str]:
+    """配列値を正規化します（list と JSON文字列の両対応）。"""
+    if field is None:
         return []
-    
-    try:
-        result = json.loads(field)
-        if isinstance(result, list):
-            return result
-    except (json.JSONDecodeError, TypeError):
-        pass
-    
-    return []
+
+    if isinstance(field, list):
+        return [str(v).strip() for v in field if str(v).strip()]
+
+    text = str(field).strip()
+    if not text:
+        return []
+
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [str(v).strip() for v in parsed if str(v).strip()]
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    if split_plain_text:
+        parts = re.split(r"[、,，/／・;]+", text)
+        normalized = [p.strip() for p in parts if p.strip()]
+        if normalized:
+            return normalized
+
+    return [text]
+
+
+def _parse_json_array(field) -> list:
+    """配列項目をPython listに変換します（list と JSON文字列の両対応）。"""
+    return _normalize_list_value(field, split_plain_text=True)
 
 
 def _normalize_skill(skill: str) -> str:
@@ -132,15 +148,75 @@ def _match_skills(
     return (required_ok, skill_score, details)
 
 
-def _match_salary(talent_price: Optional[str], project_price: Optional[str]) -> Tuple[bool, int, dict]:
+def _parse_optional_number(value) -> Optional[float]:
+    """数値または数値文字列を float へ変換します。"""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _parse_optional_bool(value) -> Optional[bool]:
+    """真偽値/真偽値文字列を bool へ変換します。"""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+
+    text = str(value).strip().lower()
+    if not text or text in ("none", "null"):
+        return None
+    if text in ("true", "1", "yes", "y", "はい", "可", "ok"):
+        return True
+    if text in ("false", "0", "no", "n", "いいえ", "不可", "ng"):
+        return False
+    return None
+
+
+def _parse_project_price_range(project_record: dict) -> Tuple[Optional[float], Optional[float]]:
+    """案件レコードから単価下限/単価上限を取得します。"""
+    project_min = _parse_optional_number(project_record.get("単価下限"))
+    project_max = _parse_optional_number(project_record.get("単価上限"))
+
+    if project_min is None and project_max is not None:
+        project_min = project_max
+    if project_max is None and project_min is not None:
+        project_max = project_min
+
+    return (project_min, project_max)
+
+
+def _parse_talent_price_range(talent_price) -> Tuple[Optional[float], Optional[float]]:
+    """人材の希望単価（単一数値）を min/max レンジへ正規化します。"""
+    single_value = _parse_optional_number(talent_price)
+    if single_value is not None:
+        return (single_value, single_value)
+
+    # 互換性のため、旧データの範囲文字列はフォールバックで解釈する。
+    return _parse_price_range(talent_price)
+
+
+def _match_salary(talent_price: Optional[str], project_record: dict) -> Tuple[bool, int, dict]:
     """給与マッチング判定を実施します。
 
     :param talent_price: 人材の希望単価。
-    :param project_price: 案件の単価。
+    :param project_record: 案件レコード辞書。
     :return: (マッチ判定, スコア加点, 詳細情報) の3要素タプル。
     """
-    talent_min, talent_max = _parse_price_range(talent_price)
-    project_min, project_max = _parse_price_range(project_price)
+    talent_min, talent_max = _parse_talent_price_range(talent_price)
+    project_min, project_max = _parse_project_price_range(project_record)
     
     # どちらかが parse に失敗したら、スキップ（条件なし）
     if talent_min is None or project_min is None:
@@ -172,39 +248,42 @@ def _match_constraints(talent_record: dict, project_record: dict) -> Tuple[bool,
     details = {}
     
     # 外国籍チェック
-    talent_foreign = talent_record.get("外国籍", "").strip().lower()
-    project_foreign_ok = project_record.get("外国籍可否", "").strip().lower()
-    
-    if project_foreign_ok and project_foreign_ok != "":
-        # 案件が外国籍の可否を指定している場合
-        if talent_foreign in ("true", "true", "1", "はい", "可"):
-            # 人材が外国籍の場合、案件が「外国籍可否: true/可」である必要
-            if project_foreign_ok not in ("true", "yes", "可", "1", "ok"):
+    talent_foreign = _parse_optional_bool(talent_record.get("外国籍"))
+    project_foreign_ok = _parse_optional_bool(project_record.get("外国籍可否"))
+
+    if project_foreign_ok is not None:
+        # 案件が外国籍可否を指定している場合
+        if talent_foreign is True:
+            if project_foreign_ok is not True:
                 constraints_ok = False
             details["foreign"] = "talent_is_foreign_but_project_not_ok"
-        else:
+        elif talent_foreign is False:
             details["foreign"] = "talent_domestic_ok"
+        else:
+            details["foreign"] = "talent_foreign_unknown"
     else:
         details["foreign"] = "project_no_restriction"
     
     # 個人事業主チェック
-    talent_freelance = talent_record.get("個人事業主", "").strip().lower()
-    project_freelance_ok = project_record.get("個人事業主可否", "").strip().lower()
-    
-    if project_freelance_ok and project_freelance_ok != "":
-        if talent_freelance in ("true", "1", "はい", "可"):
-            if project_freelance_ok not in ("true", "yes", "可", "1", "ok"):
+    talent_freelance = _parse_optional_bool(talent_record.get("個人事業主"))
+    project_freelance_ok = _parse_optional_bool(project_record.get("個人事業主可否"))
+
+    if project_freelance_ok is not None:
+        if talent_freelance is True:
+            if project_freelance_ok is not True:
                 constraints_ok = False
             details["freelance"] = "talent_is_freelance_but_project_not_ok"
-        else:
+        elif talent_freelance is False:
             details["freelance"] = "talent_employee_ok"
+        else:
+            details["freelance"] = "talent_freelance_unknown"
     else:
         details["freelance"] = "project_no_restriction"
 
     # 商流制限_貴社所属迄チェック
     # True の場合、人材の所属が弊社直接雇用（「弊社」「直」を含む）である必要がある
-    project_direct_only = project_record.get("商流制限_貴社所属迄", False)
-    if project_direct_only:
+    project_direct_only = _parse_optional_bool(project_record.get("商流制限_貴社所属迄"))
+    if project_direct_only is True:
         talent_belonging = talent_record.get("所属", "").strip()
         is_direct = any(kw in talent_belonging for kw in ["弊社", "直属", "直雇", "直接"])
         if not is_direct:
@@ -229,55 +308,97 @@ def _match_constraints(talent_record: dict, project_record: dict) -> Tuple[bool,
     return (constraints_ok, constraint_score, details)
 
 
+def _parse_multi_value_field(field) -> list[str]:
+    """複数値フィールド（list / JSON配列文字列 / 区切り文字列）を正規化して返します。"""
+    values = _normalize_list_value(field, split_plain_text=True)
+    return [value.lower() for value in values]
 
 
+def _match_role_and_phase(talent_record: dict, project_record: dict) -> Tuple[bool, int, dict]:
+    """担当と工程のマッチング判定を実施します（ソフト制約）。"""
+    talent_roles = _parse_multi_value_field(talent_record.get("担当"))
+    project_roles = _parse_multi_value_field(project_record.get("担当"))
+    role_overlap = sorted(set(talent_roles) & set(project_roles))
 
-def _parse_talent_age(age_val) -> Optional[int]:
-    """人材の年齢値を整数に変換します。
+    if talent_roles and project_roles:
+        role_status = "matched" if role_overlap else "not_matched"
+        role_score = 10 if role_overlap else 0
+    else:
+        role_status = "unknown"
+        role_score = 0
 
-    :param age_val: 年齢（int または str）。
-    :return: 年齢整数。変換不可なら None。
-    """
-    if age_val is None:
+    talent_phases = _parse_multi_value_field(talent_record.get("工程"))
+    project_phases = _parse_multi_value_field(project_record.get("工程"))
+    phase_overlap = sorted(set(talent_phases) & set(project_phases))
+
+    if talent_phases and project_phases:
+        phase_status = "matched" if phase_overlap else "not_matched"
+        phase_score = 10 if phase_overlap else 0
+    else:
+        phase_status = "unknown"
+        phase_score = 0
+
+    details = {
+        "role": {
+            "status": role_status,
+            "talent_values": talent_roles,
+            "project_values": project_roles,
+            "overlap": role_overlap,
+        },
+        "phase": {
+            "status": phase_status,
+            "talent_values": talent_phases,
+            "project_values": project_phases,
+            "overlap": phase_overlap,
+        },
+    }
+
+    return (True, role_score + phase_score, details)
+
+
+def _parse_optional_int(value) -> Optional[int]:
+    """整数または整数文字列を整数へ変換します。"""
+    if value is None:
         return None
-    if isinstance(age_val, int):
-        return age_val
+    if isinstance(value, int):
+        return value
+    s = str(value).strip()
+    if not s:
+        return None
+    if s.lower() in ('null', 'none'):
+        return None
     import re
-    s = str(age_val).strip()
-    # 例: "35" / "35歳"
-    m = re.match(r'^(\d+)', s)
+    m = re.search(r'\d+', s)
     if m:
-        return int(m.group(1))
-    # 例: "30代前半" -> 32 / "30代後半" -> 37 / "30代" -> 35
-    m = re.match(r'^(\d+)代(前半|後半)?', s)
-    if m:
-        base = int(m.group(1))
-        suffix = m.group(2)
-        if suffix == '前半':
-            return base + 2
-        if suffix == '後半':
-            return base + 7
-        return base + 5
+        return int(m.group(0))
     return None
 
 
-def _parse_project_age_limit(age_str: Optional[str]) -> Optional[int]:
-    """案件の年齢制限文字列を数値上限に変換します。
+def _parse_talent_age_range(talent_record: dict) -> Tuple[Optional[int], Optional[int]]:
+    """人材レコードから単一年齢を取得し、年齢レンジへ正規化します。"""
+    age_value = _parse_optional_int(talent_record.get('年齢'))
+    if age_value is not None:
+        return age_value, age_value
 
-    :param age_str: 年齢文字列（例: 「〜45歳」「45歳まで」「制限なし」）。
-    :return: 上限年齢（制限なしまたは未記載は None）。
-    """
-    if not age_str:
-        return None
-    s = str(age_str).strip()
-    if s in ('制限なし', '不問', '不明', ''):
-        return None
-    import re
-    # 例: 「〜45歳」「45歳まで」「45歳以下」「45迄」「~45」
-    m = re.search(r'(\d+)\s*(?:歳|迄|まで|以下)?', s)
-    if m:
-        return int(m.group(1))
-    return None
+    # 互換性のため、旧データの年齢下限/上限がある場合は利用する。
+    talent_age_min = _parse_optional_int(talent_record.get('年齢下限'))
+    talent_age_max = _parse_optional_int(talent_record.get('年齢上限'))
+
+    # 片側のみ指定された場合は同値で補完する。
+    if talent_age_min is None and talent_age_max is not None:
+        talent_age_min = talent_age_max
+    if talent_age_max is None and talent_age_min is not None:
+        talent_age_max = talent_age_min
+
+    return talent_age_min, talent_age_max
+
+
+def _parse_project_age_range(project_record: dict) -> Tuple[Optional[int], Optional[int]]:
+    """案件レコードから年齢下限/上限を取得します。"""
+    age_min = _parse_optional_int(project_record.get('年齢下限'))
+    age_max = _parse_optional_int(project_record.get('年齢上限'))
+
+    return age_min, age_max
 
 
 def _match_age(talent_record: dict, project_record: dict) -> Tuple[bool, int, dict]:
@@ -287,21 +408,39 @@ def _match_age(talent_record: dict, project_record: dict) -> Tuple[bool, int, di
     :param project_record: 案件レコード辞書。
     :return: (True, スコア, 詳細) の3要素タプル。
     """
-    talent_age = _parse_talent_age(talent_record.get('年齢'))
-    project_limit = _parse_project_age_limit(project_record.get('年齢'))
+    talent_age_min, talent_age_max = _parse_talent_age_range(talent_record)
+    project_age_min, project_age_max = _parse_project_age_range(project_record)
+
+    # 範囲の逆転があれば年齢判定は無効化する。
+    if (
+        talent_age_min is not None and talent_age_max is not None and talent_age_min > talent_age_max
+    ):
+        return (True, 0, {'status': 'invalid_talent_age_range'})
+    if (
+        project_age_min is not None and project_age_max is not None and project_age_min > project_age_max
+    ):
+        return (True, 0, {'status': 'invalid_project_age_range'})
 
     # 制限なしまたは人材の年齢不明の場合はデータなしとしてスキップ
-    if project_limit is None or talent_age is None:
+    if (
+        (talent_age_min is None and talent_age_max is None)
+        or (project_age_min is None and project_age_max is None)
+    ):
         return (True, 0, {'status': 'unknown_age'})
 
-    within = talent_age <= project_limit
+    # 人材年齢レンジと案件制約レンジの重なりで判定する。
+    within_lower = True if project_age_min is None else talent_age_max >= project_age_min
+    within_upper = True if project_age_max is None else talent_age_min <= project_age_max
+    within = within_lower and within_upper
     score = 15 if within else 0
     return (
         True,  # ソフト制約なので常に True
         score,
         {
-            'talent_age': talent_age,
-            'project_limit': project_limit,
+            'talent_age_min': talent_age_min,
+            'talent_age_max': talent_age_max,
+            'project_age_min': project_age_min,
+            'project_age_max': project_age_max,
             'within_limit': within,
         },
     )
@@ -345,7 +484,7 @@ def calculate_match_score(talent_record: dict, project_record: dict) -> Tuple[in
     # 2. 給与マッチング
     salary_match, salary_score, salary_details = _match_salary(
         talent_record.get("希望単価"),
-        project_record.get("単価"),
+        project_record,
     )
     total_score += salary_score
     reason["salary"] = {
@@ -354,7 +493,19 @@ def calculate_match_score(talent_record: dict, project_record: dict) -> Tuple[in
         "details": salary_details,
     }
     
-    # 3. 立場制約チェック
+    # 3. 担当・工程マッチング
+    role_phase_match, role_phase_score, role_phase_details = _match_role_and_phase(
+        talent_record,
+        project_record,
+    )
+    total_score += role_phase_score
+    reason["role_phase"] = {
+        "match": role_phase_match,
+        "score": role_phase_score,
+        "details": role_phase_details,
+    }
+
+    # 4. 立場制約チェック
     constraint_match, constraint_score, constraint_details = _match_constraints(
         talent_record,
         project_record,
@@ -366,7 +517,7 @@ def calculate_match_score(talent_record: dict, project_record: dict) -> Tuple[in
         "details": constraint_details,
     }
     
-    # 4. 年齢
+    # 5. 年齢
     age_match, age_score, age_details = _match_age(
         talent_record,
         project_record,
@@ -382,6 +533,21 @@ def calculate_match_score(talent_record: dict, project_record: dict) -> Tuple[in
     total_score = min(100, total_score)
     
     return (total_score, reason)
+
+
+def _is_same_sender(talent_record: dict, project_record: dict) -> bool:
+    """folder または sender_addr が一致する場合に同一送信者とみなします。"""
+    talent_folder = str(talent_record.get("folder") or "").strip().lower()
+    project_folder = str(project_record.get("folder") or "").strip().lower()
+    if talent_folder and project_folder and talent_folder == project_folder:
+        return True
+
+    talent_sender_addr = str(talent_record.get("sender_addr") or "").strip().lower()
+    project_sender_addr = str(project_record.get("sender_addr") or "").strip().lower()
+    if talent_sender_addr and project_sender_addr and talent_sender_addr == project_sender_addr:
+        return True
+
+    return False
 
 
 def process_all_matches(conn: sqlite3.Connection) -> dict:
@@ -406,6 +572,7 @@ def process_all_matches(conn: sqlite3.Connection) -> dict:
     total_matches = 0
     matches_added = 0
     matches_updated = 0
+    same_sender_skipped = 0
     
     # 全組み合わせをスキャン
     for talent_id in talent_ids:
@@ -416,6 +583,11 @@ def process_all_matches(conn: sqlite3.Connection) -> dict:
         for project_id in project_ids:
             project_record = get_project_record(conn, project_id)
             if not project_record:
+                continue
+
+            # 同一送信者と判断したペアはマッチング対象外とする。
+            if _is_same_sender(talent_record, project_record):
+                same_sender_skipped += 1
                 continue
             
             total_matches += 1
@@ -436,6 +608,7 @@ def process_all_matches(conn: sqlite3.Connection) -> dict:
         "total_matches": total_matches,
         "added": matches_added,
         "updated": matches_updated,
+        "same_sender_skipped": same_sender_skipped,
     }
 
 
