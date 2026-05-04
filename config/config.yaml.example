@@ -40,3 +40,5 @@ lmstudio:
   num_workers: 4
   signature_trim_chars: 300
   greeting_trim_chars: 100
+  interval_work_seconds: 180  # この秒数連続稼働したらインターバルを挿入（0で無効）
+  interval_rest_seconds: 30   # インターバルの休止秒数

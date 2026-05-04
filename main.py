@@ -276,6 +276,8 @@ def _run_lm_postprocess(conn, run_talent: bool = True, run_project: bool = True)
     lmstudio_num_workers = max(1, int(config.get('lmstudio', {}).get('num_workers', 4)))
     lmstudio_signature_trim_chars = max(0, int(config.get('lmstudio', {}).get('signature_trim_chars', 300)))
     lmstudio_greeting_trim_chars = max(0, int(config.get('lmstudio', {}).get('greeting_trim_chars', 100)))
+    lmstudio_interval_work_seconds = max(0, int(config.get('lmstudio', {}).get('interval_work_seconds', 0)))
+    lmstudio_interval_rest_seconds = max(0, int(config.get('lmstudio', {}).get('interval_rest_seconds', 30)))
     lm_exclude_folders_talent = [str(name).strip() for name in LM_EXCLUDE_FOLDERS_TALENT if str(name).strip()]
     lm_exclude_folders_project = [str(name).strip() for name in LM_EXCLUDE_FOLDERS_PROJECT if str(name).strip()]
     enabled_tables = []
@@ -299,6 +301,8 @@ def _run_lm_postprocess(conn, run_talent: bool = True, run_project: bool = True)
         max_workers=lmstudio_num_workers,
         signature_trim_chars=lmstudio_signature_trim_chars,
         greeting_trim_chars=lmstudio_greeting_trim_chars,
+        interval_work_seconds=lmstudio_interval_work_seconds,
+        interval_rest_seconds=lmstudio_interval_rest_seconds,
     )
     logger.info(f'LM後処理結果: success={lm_success}, error={lm_error}')
 

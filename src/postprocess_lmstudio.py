@@ -2,6 +2,7 @@ import csv
 import json
 import logging
 import re
+import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -1431,11 +1432,15 @@ def process_pending_records_with_lmstudio(
     max_workers: int = 1,
     signature_trim_chars: int = 300,
     greeting_trim_chars: int = 100,
+    interval_work_seconds: int = 0,
+    interval_rest_seconds: int = 30,
 ) -> tuple[int, int]:
     """status='0' のレコードを LM Studio でJSON化して保存します。"""
     total_success = 0
     total_error = 0
     normalized_workers = max(1, int(max_workers))
+    use_interval = interval_work_seconds > 0 and interval_rest_seconds > 0
+    interval_start_time = time.monotonic()
     enabled_tables_set = set(enabled_tables) if enabled_tables else {"mails_talent", "mails_project"}
     normalized_excludes_talent = [
         str(folder_name).strip()
@@ -1476,51 +1481,65 @@ def process_pending_records_with_lmstudio(
 
         futures: dict[Any, int] = {}
         processed_count = 0
+        record_list = list(records)
         with ThreadPoolExecutor(max_workers=normalized_workers) as executor:
-            for record_id, body_text in records:
-                future = executor.submit(
-                    _process_single_record_for_lm,
-                    endpoint,
-                    model,
-                    body_text,
-                    category,
-                    timeout,
-                    max_tokens,
-                    signature_trim_chars,
-                    greeting_trim_chars,
-                )
-                futures[future] = record_id
-                logger.debug(f"LM処理を投入: table={table_name}, id={record_id}")
+            for batch_start in range(0, len(record_list), normalized_workers):
+                batch = record_list[batch_start:batch_start + normalized_workers]
+                batch_futures: dict[Any, int] = {}
+                for record_id, body_text in batch:
+                    future = executor.submit(
+                        _process_single_record_for_lm,
+                        endpoint,
+                        model,
+                        body_text,
+                        category,
+                        timeout,
+                        max_tokens,
+                        signature_trim_chars,
+                        greeting_trim_chars,
+                    )
+                    batch_futures[future] = record_id
+                    futures[future] = record_id
+                    logger.debug(f"LM処理を投入: table={table_name}, id={record_id}")
 
-            for future in as_completed(futures):
-                record_id = futures[future]
-                processed_count += 1
-                try:
-                    json_text, first_obj = future.result()
-                    json_text, first_obj = _apply_key_replacements_after_lm(
-                        json_text=json_text,
-                        properties=first_obj,
-                        category=category,
-                        table_name=table_name,
-                        record_id=record_id,
-                    )
-                    update_record_json_status_and_properties(
-                        conn=conn,
-                        table_name=table_name,
-                        record_id=record_id,
-                        json_data=json_text,
-                        properties=first_obj,
-                        status="1",
-                    )
-                    total_success += 1
-                    logger.info(
-                        f"LM処理成功: table={table_name}, id={record_id}, progress={processed_count}/{len(records)}"
-                    )
-                except Exception as e:
-                    total_error += 1
-                    logger.error(
-                        f"LM処理失敗: table={table_name}, id={record_id}, progress={processed_count}/{len(records)}, error={e}"
-                    )
+                for future in as_completed(batch_futures):
+                    record_id = batch_futures[future]
+                    processed_count += 1
+                    try:
+                        json_text, first_obj = future.result()
+                        json_text, first_obj = _apply_key_replacements_after_lm(
+                            json_text=json_text,
+                            properties=first_obj,
+                            category=category,
+                            table_name=table_name,
+                            record_id=record_id,
+                        )
+                        update_record_json_status_and_properties(
+                            conn=conn,
+                            table_name=table_name,
+                            record_id=record_id,
+                            json_data=json_text,
+                            properties=first_obj,
+                            status="1",
+                        )
+                        total_success += 1
+                        logger.info(
+                            f"LM処理成功: table={table_name}, id={record_id}, progress={processed_count}/{len(record_list)}"
+                        )
+                    except Exception as e:
+                        total_error += 1
+                        logger.error(
+                            f"LM処理失敗: table={table_name}, id={record_id}, progress={processed_count}/{len(record_list)}, error={e}"
+                        )
+
+                if use_interval and batch_start + normalized_workers < len(record_list):
+                    elapsed = time.monotonic() - interval_start_time
+                    if elapsed >= interval_work_seconds:
+                        logger.info(
+                            f"インターバル: {elapsed:.1f}秒稼働しました。{interval_rest_seconds}秒間待機します。"
+                        )
+                        time.sleep(interval_rest_seconds)
+                        interval_start_time = time.monotonic()
 
         conn.commit()
 
