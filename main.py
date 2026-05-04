@@ -79,7 +79,8 @@ def _parse_args() -> argparse.Namespace:
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument('-m', action='store_true', help='メール取得のみ実行')
-    group.add_argument('-l', action='store_true', help='LM後処理のみ実行')
+    group.add_argument('-lt', action='store_true', help='LM後処理（人材）のみ実行')
+    group.add_argument('-lp', action='store_true', help='LM後処理（案件）のみ実行')
     group.add_argument('-n', action='store_true', help='マッチング処理のみ実行')
     group.add_argument('-d', action='store_true', help='古いレコード削除のみ実行')
     group.add_argument('-c', action='store_true', help='CSV出力のみ実行')
@@ -91,8 +92,10 @@ def _resolve_mode(args: argparse.Namespace) -> str:
     """引数から実行モードを決定します。"""
     if args.m:
         return 'mail'
-    if args.l:
-        return 'lm'
+    if args.lt:
+        return 'lm_talent'
+    if args.lp:
+        return 'lm_project'
     if args.n:
         return 'matching'
     if args.d:
@@ -116,10 +119,19 @@ def _resolve_process_plan(args: argparse.Namespace, process_config: dict[str, bo
             'delete_old': False,
             'csv_export': False,
         }
-    if args.l:
+    if args.lt:
         return {
             'mail_fetch': False,
             'lm_postprocess_talent': True,
+            'lm_postprocess_project': False,
+            'matching': False,
+            'delete_old': False,
+            'csv_export': False,
+        }
+    if args.lp:
+        return {
+            'mail_fetch': False,
+            'lm_postprocess_talent': False,
             'lm_postprocess_project': True,
             'matching': False,
             'delete_old': False,
@@ -259,7 +271,8 @@ def _run_lm_postprocess(conn, run_talent: bool = True, run_project: bool = True)
     lmstudio_model = config.get('lmstudio', {}).get('model', 'Qwen2.5-7B-Instruct-GGUF')
     lmstudio_timeout = int(config.get('lmstudio', {}).get('timeout', 60))
     lmstudio_max_tokens = max(1, int(config.get('lmstudio', {}).get('max_tokens', 512)))
-    lmstudio_limit = int(config.get('lmstudio', {}).get('limit_per_table', 500))
+    lmstudio_limit_talent = int(config.get('lmstudio', {}).get('limit_per_table_talent', 500))
+    lmstudio_limit_project = int(config.get('lmstudio', {}).get('limit_per_table_project', 500))
     lmstudio_num_workers = max(1, int(config.get('lmstudio', {}).get('num_workers', 4)))
     lmstudio_signature_trim_chars = max(0, int(config.get('lmstudio', {}).get('signature_trim_chars', 300)))
     lmstudio_greeting_trim_chars = max(0, int(config.get('lmstudio', {}).get('greeting_trim_chars', 100)))
@@ -277,7 +290,8 @@ def _run_lm_postprocess(conn, run_talent: bool = True, run_project: bool = True)
         model=lmstudio_model,
         timeout=lmstudio_timeout,
         max_tokens=lmstudio_max_tokens,
-        limit_per_table=lmstudio_limit,
+        limit_per_table_talent=lmstudio_limit_talent,
+        limit_per_table_project=lmstudio_limit_project,
         exclude_folders_talent=lm_exclude_folders_talent,
         exclude_folders_project=lm_exclude_folders_project,
         enabled_tables=enabled_tables,

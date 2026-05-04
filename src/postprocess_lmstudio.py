@@ -1422,7 +1422,8 @@ def process_pending_records_with_lmstudio(
     model: str,
     timeout: int = 120,
     max_tokens: int = 2048,
-    limit_per_table: int = 500,
+    limit_per_table_talent: int = 500,
+    limit_per_table_project: int = 500,
     exclude_folders_talent: list[str] | None = None,
     exclude_folders_project: list[str] | None = None,
     enabled_tables: list[str] | None = None,
@@ -1457,10 +1458,15 @@ def process_pending_records_with_lmstudio(
             if table_name == "mails_talent"
             else normalized_excludes_project
         )
+        current_limit = (
+            limit_per_table_talent
+            if table_name == "mails_talent"
+            else limit_per_table_project
+        )
         records = get_pending_records(
             conn,
             table_name,
-            limit=limit_per_table,
+            limit=current_limit,
             exclude_folders=current_excludes,
         )
         category = "人材" if table_name == "mails_talent" else "案件"
