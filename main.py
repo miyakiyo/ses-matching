@@ -241,7 +241,7 @@ def _acquire_access_token() -> str:
     return access_token
 
 
-def _run_mail_fetch(conn, access_token: str) -> tuple[datetime, int, int]:
+def _run_mail_fetch(conn, access_token: str) -> tuple[datetime, int, int, int, int]:
     """メール取得と分類保存を実行します。"""
     mailbox = config.get('mailbox', {}).get('shared_mailbox', '*****@offgrid.co.jp')
     last_run_at = get_last_run_at(conn)
@@ -260,6 +260,8 @@ def _run_mail_fetch(conn, access_token: str) -> tuple[datetime, int, int]:
 
     project_keywords = config.get('ses', {}).get('project_keywords', ['案件', '募集'])
     talent_keywords = config.get('ses', {}).get('talent_keywords', ['人材', '要員'])
+    status2_keywords = config.get('ses', {}).get('status2_keywords', [])
+    status3_window_hours = int(config.get('ses', {}).get('status3_window_hours', 48))
     titles, mail_counts = get_mail_subjects(
         mailbox,
         start,
@@ -268,6 +270,8 @@ def _run_mail_fetch(conn, access_token: str) -> tuple[datetime, int, int]:
         conn=conn,
         project_keywords=project_keywords,
         talent_keywords=talent_keywords,
+        status2_keywords=status2_keywords,
+        status3_window_hours=status3_window_hours,
         not_folder=NOT_FOLDER,
         not_folder_keywords=NOT_FOLDER_KEYWORDS,
         token_refresher=_acquire_access_token,
@@ -281,7 +285,13 @@ def _run_mail_fetch(conn, access_token: str) -> tuple[datetime, int, int]:
             append_unclassified_log(unclassified_log_path, folder, subject)
             logger.info(str((folder, subject, category)))
 
-    return end, mail_counts.get('project', 0), mail_counts.get('talent', 0)
+    return (
+        end,
+        mail_counts.get('project', 0),
+        mail_counts.get('talent', 0),
+        mail_counts.get('status2', 0),
+        mail_counts.get('status3', 0),
+    )
 
 
 def _run_lm_postprocess(conn, run_talent: bool = True, run_project: bool = True) -> tuple[int, int, int, int]:
@@ -353,9 +363,13 @@ def _run_matching_only(conn) -> dict[str, int]:
     logger.info('マッチング処理開始...')
     try:
         match_stats = process_all_matches(conn)
+        timings = match_stats.get('timings', {})
         logger.info(
             f'マッチング処理完了: total={match_stats["total_matches"]}, '
-            f'added={match_stats["added"]}, updated={match_stats["updated"]}'
+            f'added={match_stats["added"]}, updated={match_stats["updated"]}, '
+            f'total_elapsed={timings.get("total_elapsed_seconds", 0):.2f}s, '
+            f'score_calc={timings.get("score_calc_seconds", 0):.2f}s, '
+            f'add_match={timings.get("add_match_seconds", 0):.2f}s'
         )
         return match_stats
     except Exception as e:
@@ -381,10 +395,10 @@ if __name__ == '__main__':
         if process_plan['mail_fetch']:
             try:
                 access_token = _acquire_access_token()
-                end, mail_project_count, mail_talent_count = _run_mail_fetch(conn, access_token)
+                end, mail_project_count, mail_talent_count, mail_status2_count, mail_status3_count = _run_mail_fetch(conn, access_token)
                 _log_result_counts(
                     result_counts_logger,
-                    f'process=mail status=success mail_project={mail_project_count} mail_talent={mail_talent_count}',
+                    f'process=mail status=success mail_project={mail_project_count} mail_talent={mail_talent_count} status2={mail_status2_count} status3={mail_status3_count}',
                 )
             except Exception as e:
                 _log_result_counts(

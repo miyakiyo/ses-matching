@@ -25,6 +25,21 @@ def classify_ses_subject(subject: str, project_keywords: List[str], talent_keywo
     return "未分類"
 
 
+def should_mark_status2(subject: str, body: str, status2_keywords: List[str]) -> bool:
+    """件名または本文に指定キーワードが含まれるか判定します。
+
+    :param subject: メール件名。
+    :param body: メール本文。
+    :param status2_keywords: status=2 にしたいキーワード一覧。
+    :return: いずれかのキーワードが含まれるなら True。
+    """
+    if not status2_keywords:
+        return False
+
+    normalized = f"{subject or ''}\n{body or ''}".lower()
+    return any(keyword and str(keyword).lower() in normalized for keyword in status2_keywords)
+
+
 def append_unclassified_log(log_path: str, folder: str, subject: str) -> None:
     """未分類メール情報をログファイルへ追記します。
 

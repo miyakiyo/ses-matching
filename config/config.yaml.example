@@ -25,19 +25,21 @@ processes:
 # SES分類キーワード
 ses:
   project_keywords: [案件, 募集, 急募, 増員, 交代枠, エンド直, 元請直, 現場直, 参画予定, 参画中, 【ARI】, 元請け直, 商流不問, 開始]  # 案件判定に使うキーワード
-  talent_keywords: [人材, 要員, プロパー,技術者, 要員, 弊社所属, 稼働可能, 参画可能, 待機, 空き, フリーランス, 即戦力, 個人事業主, 正社員, 懇意BP, 歳, 直個人]  # 人材判定に使うキーワード
+  talent_keywords: [人材, 要員, プロパー,技術者, 要員, 弊社所属, 弊社社員, 稼働可能, 参画可能, 待機, 空き, フリーランス, 即戦力, 個人事業主, 正社員, 懇意BP, 歳, 直個人]  # 人材判定に使うキーワード
+  status2_keywords: [１社下, 1社下, 中国籍, 韓国籍, ベトナム籍, 帰化]  # mails_talent 保存時に status=2 とするキーワード（件名/本文の部分一致）
+  status3_window_hours: 72  # status=3 重複判定の時間窓（時間）
   unclassified_log_path: logs/unclassified.log  # 未分類メールのログ出力先
   log_path: "logs/app.log"  # アプリケーションログの出力先
 
 # LM Studio 設定
 lmstudio:
   endpoint: http://localhost:1234/v1/chat/completions  # LM Studio API エンドポイント
-  model: Qwen2.5-7B-Instruct-GGUF  # 使用するモデル名
-  timeout: 60  # リクエストタイムアウト秒数
+  model: gemma-2-9b-it  # 使用するモデル名
+  timeout: 180  # リクエストタイムアウト秒数
   max_tokens: 4096  # 生成トークン上限
   limit_per_table_talent: 500  # 人材テーブルの1回あたり処理件数上限
   limit_per_table_project: 500  # 案件テーブルの1回あたり処理件数上限
-  num_workers: 4  # 並列実行ワーカー数
+  num_workers: 1  # 並列実行ワーカー数
   signature_trim_chars: 300  # 本文末尾で署名として削る文字数
   greeting_trim_chars: 100  # 本文先頭で挨拶として削る文字数
   interval_work_seconds: 180  # この秒数連続稼働したらインターバルを挿入（0で無効）

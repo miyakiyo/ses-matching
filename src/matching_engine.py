@@ -1,6 +1,8 @@
 import json
 import sqlite3
 import re
+import logging
+from time import perf_counter
 from typing import Optional, Tuple
 from .database_utils import (
     get_talent_record,
@@ -8,6 +10,12 @@ from .database_utils import (
     add_match,
     check_existing_match,
 )
+
+
+logger = logging.getLogger(__name__)
+
+# 全組み合わせスキャン時の進捗ログ間隔（組み合わせ数）。
+MATCH_PROGRESS_LOG_INTERVAL = 1000
 
 
 def _normalize_list_value(field, split_plain_text: bool = True) -> list[str]:
@@ -284,7 +292,7 @@ def _match_constraints(talent_record: dict, project_record: dict) -> Tuple[bool,
     # True の場合、人材の所属が弊社直接雇用（「弊社」「直」を含む）である必要がある
     project_direct_only = _parse_optional_bool(project_record.get("商流制限_貴社所属迄"))
     if project_direct_only is True:
-        talent_belonging = talent_record.get("所属", "").strip()
+        talent_belonging = str(talent_record.get("所属") or "").strip()
         is_direct = any(kw in talent_belonging for kw in ["弊社", "直属", "直雇", "直接"])
         if not is_direct:
             constraints_ok = False
@@ -294,8 +302,8 @@ def _match_constraints(talent_record: dict, project_record: dict) -> Tuple[bool,
 
     # 派遣案件と1社下所属の不適合チェック
     # 派遣案件で人材が「1社下所属」の場合は NG
-    contract_type = project_record.get("契約形態", "").strip()
-    talent_belonging = talent_record.get("所属", "").strip()
+    contract_type = str(project_record.get("契約形態") or "").strip()
+    talent_belonging = str(talent_record.get("所属") or "").strip()
     
     if contract_type == "派遣" and "1社下" in talent_belonging:
         constraints_ok = False
@@ -558,13 +566,30 @@ def process_all_matches(conn: sqlite3.Connection) -> dict:
     :param conn: SQLiteコネクション。
     :return: 処理統計 {"total_matches": int, "added": int, "updated": int} の辞書。
     """
+    started_at = perf_counter()
+    stats = {
+        "fetch_ids_seconds": 0.0,
+        "fetch_talent_seconds": 0.0,
+        "fetch_project_seconds": 0.0,
+        "same_sender_check_seconds": 0.0,
+        "score_calc_seconds": 0.0,
+        "check_existing_seconds": 0.0,
+        "add_match_seconds": 0.0,
+        "loop_seconds": 0.0,
+        "missing_talent_records": 0,
+        "missing_project_records": 0,
+        "pairs_scanned": 0,
+    }
+
     # status='1'（LM処理済み）の人材・案件を取得
+    ids_fetch_started = perf_counter()
     talent_rows = conn.execute(
         "SELECT id FROM mails_talent WHERE status = '1' ORDER BY id"
     ).fetchall()
     project_rows = conn.execute(
         "SELECT id FROM mails_project WHERE status = '1' ORDER BY id"
     ).fetchall()
+    stats["fetch_ids_seconds"] = perf_counter() - ids_fetch_started
     
     talent_ids = [row[0] for row in talent_rows]
     project_ids = [row[0] for row in project_rows]
@@ -573,42 +598,130 @@ def process_all_matches(conn: sqlite3.Connection) -> dict:
     matches_added = 0
     matches_updated = 0
     same_sender_skipped = 0
+
+    logger.info(
+        "マッチング計測開始: talent=%s, project=%s, potential_pairs=%s",
+        len(talent_ids),
+        len(project_ids),
+        len(talent_ids) * len(project_ids),
+    )
     
     # 全組み合わせをスキャン
+    loop_started = perf_counter()
     for talent_id in talent_ids:
+        talent_fetch_started = perf_counter()
         talent_record = get_talent_record(conn, talent_id)
+        stats["fetch_talent_seconds"] += perf_counter() - talent_fetch_started
         if not talent_record:
+            stats["missing_talent_records"] += 1
             continue
         
         for project_id in project_ids:
+            project_fetch_started = perf_counter()
             project_record = get_project_record(conn, project_id)
+            stats["fetch_project_seconds"] += perf_counter() - project_fetch_started
             if not project_record:
+                stats["missing_project_records"] += 1
                 continue
 
+            stats["pairs_scanned"] += 1
+
             # 同一送信者と判断したペアはマッチング対象外とする。
+            same_sender_started = perf_counter()
             if _is_same_sender(talent_record, project_record):
+                stats["same_sender_check_seconds"] += perf_counter() - same_sender_started
                 same_sender_skipped += 1
+
+                if (
+                    stats["pairs_scanned"] % MATCH_PROGRESS_LOG_INTERVAL == 0
+                    and stats["pairs_scanned"] > 0
+                ):
+                    elapsed = perf_counter() - started_at
+                    logger.info(
+                        "マッチング進捗: scanned=%s, effective=%s, skipped_same_sender=%s, elapsed=%.2fs",
+                        stats["pairs_scanned"],
+                        total_matches,
+                        same_sender_skipped,
+                        elapsed,
+                    )
                 continue
+            stats["same_sender_check_seconds"] += perf_counter() - same_sender_started
             
             total_matches += 1
             
             # マッチングスコアを計算
+            score_started = perf_counter()
             score, reason = calculate_match_score(talent_record, project_record)
+            stats["score_calc_seconds"] += perf_counter() - score_started
             
             # マッチング結果を保存
+            existing_started = perf_counter()
             existing = check_existing_match(conn, talent_id, project_id)
+            stats["check_existing_seconds"] += perf_counter() - existing_started
+
+            add_started = perf_counter()
             add_match(conn, talent_id, project_id, score, reason)
+            stats["add_match_seconds"] += perf_counter() - add_started
             
             if existing:
                 matches_updated += 1
             else:
                 matches_added += 1
+
+            if (
+                stats["pairs_scanned"] % MATCH_PROGRESS_LOG_INTERVAL == 0
+                and stats["pairs_scanned"] > 0
+            ):
+                elapsed = perf_counter() - started_at
+                logger.info(
+                    "マッチング進捗: scanned=%s, effective=%s, skipped_same_sender=%s, added=%s, updated=%s, elapsed=%.2fs",
+                    stats["pairs_scanned"],
+                    total_matches,
+                    same_sender_skipped,
+                    matches_added,
+                    matches_updated,
+                    elapsed,
+                )
+
+    stats["loop_seconds"] = perf_counter() - loop_started
+    total_elapsed = perf_counter() - started_at
+
+    logger.info(
+        "マッチング計測結果: total_elapsed=%.2fs, loop=%.2fs, fetch_ids=%.2fs, fetch_talent=%.2fs, fetch_project=%.2fs, same_sender=%.2fs, score_calc=%.2fs, check_existing=%.2fs, add_match=%.2fs, scanned=%s, effective=%s, added=%s, updated=%s, skipped_same_sender=%s, missing_talent=%s, missing_project=%s",
+        total_elapsed,
+        stats["loop_seconds"],
+        stats["fetch_ids_seconds"],
+        stats["fetch_talent_seconds"],
+        stats["fetch_project_seconds"],
+        stats["same_sender_check_seconds"],
+        stats["score_calc_seconds"],
+        stats["check_existing_seconds"],
+        stats["add_match_seconds"],
+        stats["pairs_scanned"],
+        total_matches,
+        matches_added,
+        matches_updated,
+        same_sender_skipped,
+        stats["missing_talent_records"],
+        stats["missing_project_records"],
+    )
     
     return {
         "total_matches": total_matches,
         "added": matches_added,
         "updated": matches_updated,
         "same_sender_skipped": same_sender_skipped,
+        "timings": {
+            "total_elapsed_seconds": total_elapsed,
+            "fetch_ids_seconds": stats["fetch_ids_seconds"],
+            "fetch_talent_seconds": stats["fetch_talent_seconds"],
+            "fetch_project_seconds": stats["fetch_project_seconds"],
+            "same_sender_check_seconds": stats["same_sender_check_seconds"],
+            "score_calc_seconds": stats["score_calc_seconds"],
+            "check_existing_seconds": stats["check_existing_seconds"],
+            "add_match_seconds": stats["add_match_seconds"],
+            "loop_seconds": stats["loop_seconds"],
+        },
     }
 
 

@@ -1,11 +1,11 @@
 from datetime import datetime, timezone, timedelta
-from typing import Callable, List, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 import logging
 import json
 import sqlite3
 import requests
 
-from .classifier_utils import classify_ses_subject, should_skip_folder
+from .classifier_utils import classify_ses_subject, should_mark_status2, should_skip_folder
 
 
 logger = logging.getLogger(__name__)
@@ -95,8 +95,10 @@ def get_mail_subjects(
     include_subfolders: bool = True,
     project_keywords: List[str] = None,
     talent_keywords: List[str] = None,
+    status2_keywords: List[str] = None,
     not_folder: List[str] = None,
     not_folder_keywords: List[str] = None,
+    status3_window_hours: int = 48,
     token_refresher: Callable[[], str] = None,
 ) -> tuple[List[Tuple[str, str]], dict[str, int]]:
     """指定期間のメール件名を取得し、分類に応じてDB保存します。
@@ -109,8 +111,10 @@ def get_mail_subjects(
     :param include_subfolders: 子フォルダを再帰的に探索するか。
     :param project_keywords: 案件分類キーワード一覧。
     :param talent_keywords: 人材分類キーワード一覧。
+    :param status2_keywords: mails_talent の status=2 判定に使うキーワード一覧。
     :param not_folder: 除外フォルダ名一覧（完全一致）。
     :param not_folder_keywords: 除外キーワード一覧（完全一致）。
+    :param status3_window_hours: status=3 判定に使う重複検知ウィンドウ時間。
     :return: ((folder_name, subject) の一覧, 分類別件数辞書)。
     """
 
@@ -157,15 +161,84 @@ def get_mail_subjects(
     project_keywords = project_keywords or []
     # 同様に人材キーワードリストもNoneなら空リストにする。
     talent_keywords = talent_keywords or []
+    # status=2 判定用キーワードもNoneなら空リストにする。
+    status2_keywords = status2_keywords or []
+    # status=3 判定時間を正規化する。
+    status3_window_hours = max(0, int(status3_window_hours or 48))
     # 除外フォルダ名リストもNoneなら空リストにする。
     not_folder = not_folder or []
     # 除外キーワードリストもNoneなら空リストにする。
     not_folder_keywords = not_folder_keywords or []
 
+    def _to_utc_datetime(value: object) -> Optional[datetime]:
+        """ISO日時文字列をUTC aware datetimeへ変換します。"""
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _to_utc_iso_z(dt: datetime) -> str:
+        """UTC aware datetime をISO文字列（末尾Z）へ変換します。"""
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _should_mark_status3(
+        table_name: str,
+        folder_value: str,
+        subject_value: str,
+        sender_addr_value: str,
+        received_dt_utc: Optional[datetime],
+    ) -> bool:
+        """重複条件に一致する status=1 レコードが直近ウィンドウ内にあるか判定します。"""
+        if conn is None:
+            return False
+        if table_name not in ("mails_talent", "mails_project"):
+            return False
+        if not subject_value or received_dt_utc is None or status3_window_hours <= 0:
+            return False
+
+        window_start = _to_utc_iso_z(received_dt_utc - timedelta(hours=status3_window_hours))
+        received_iso = _to_utc_iso_z(received_dt_utc)
+
+        row = conn.execute(
+            f"""
+            SELECT 1
+            FROM {table_name}
+            WHERE status = '1'
+              AND received_at >= ?
+              AND received_at <= ?
+              AND (
+                    (folder = ? AND subject = ?)
+                 OR (? IS NOT NULL AND sender_addr = ? AND subject = ?)
+              )
+            LIMIT 1
+            """,
+            (
+                window_start,
+                received_iso,
+                folder_value,
+                subject_value,
+                sender_addr_value,
+                sender_addr_value,
+                subject_value,
+            ),
+        ).fetchone()
+        return row is not None
+
     subjects: List[Tuple[str, str]] = []
     category_counts = {
         "project": 0,
         "talent": 0,
+        "status2": 0,
+        "status3": 0,
     }
 
     def fetch_messages_in_folder(folder_id: str, folder_name: str = "") -> None:
@@ -237,11 +310,31 @@ def get_mail_subjects(
 
                         # 全分類（人材、案件、未分類）をテーブルに保存する。
                         json_payload = json.dumps(item, ensure_ascii=False)
-                        conn.execute(
+                        received_dt_utc = _to_utc_datetime(received)
+                        received_for_db = _to_utc_iso_z(received_dt_utc) if received_dt_utc else received
+
+                        base_status = '2' if table_name == "mails_talent" and should_mark_status2(subj, body, status2_keywords) else '0'
+                        status = base_status
+                        if _should_mark_status3(
+                            table_name=table_name,
+                            folder_value=(folder_name or parent_id),
+                            subject_value=subj,
+                            sender_addr_value=sender_addr,
+                            received_dt_utc=received_dt_utc,
+                        ):
+                            status = '3'
+
+                        insert_cursor = conn.execute(
                             f"INSERT OR IGNORE INTO {table_name} "
                             "(folder, subject, sender_name, sender_addr, received_at, body, status, json_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                            (folder_name or parent_id, subj, sender_name, sender_addr, received, body, '0', json_payload),
+                            (folder_name or parent_id, subj, sender_name, sender_addr, received_for_db, body, status, json_payload),
                         )
+                        # 新規保存された行のみ status 件数に加算する。
+                        if insert_cursor.rowcount > 0:
+                            if status == '2':
+                                category_counts["status2"] += 1
+                            elif status == '3':
+                                category_counts["status3"] += 1
 
             if conn is not None:
                 # ページ単位でコミットして処理途中の再実行をしやすくする。

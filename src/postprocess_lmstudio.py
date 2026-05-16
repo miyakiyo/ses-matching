@@ -18,6 +18,15 @@ from .matching_engine import process_all_matches
 logger = logging.getLogger(__name__)
 
 
+def _truncate_for_log(text: str, limit: int = 4000) -> str:
+    """ログ出力向けに文字列を短縮し、改行を可視化する。"""
+    normalized = str(text).replace("\r", "\\r").replace("\n", "\\n")
+    if len(normalized) <= limit:
+        return normalized
+    remaining = len(normalized) - limit
+    return f"{normalized[:limit]}...<truncated:{remaining} chars>"
+
+
 _KEY_REPLACEMENT_CSV = Path(__file__).resolve().parent.parent / "config" / "key_replacements.csv"
 _KEY_REPLACEMENT_CACHE: dict[str, dict[str, str]] | None = None
 
@@ -157,26 +166,9 @@ def _backfill_project_fields_from_required_skills(properties: dict[str, Any]) ->
     if not required_skills:
         return properties
 
-    # 担当/工程はLLMが必須スキルから意味的に抽出するため、ここでは補完しない。
-    # 開発言語/データベース/OS/クラウドのみ必須スキルから補完する。
-    target_fields = ["開発言語", "データベース", "OS/クラウド"]
-    normalized = dict(properties)
-
-    for field_name in target_fields:
-        current_values = _normalize_skill_list_value(normalized.get(field_name))
-        merged_values: list[str] = []
-        seen: set[str] = set()
-
-        for value in current_values + required_skills:
-            key = value.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            merged_values.append(value)
-
-        normalized[field_name] = merged_values
-
-    return normalized
+    # 現在は必須スキルから他カラムへの補完を行わない。
+    # （開発言語/データベース/OS/クラウドへの自動マージを停止）
+    return properties
 
 
 def _apply_key_replacements_after_lm(
@@ -1387,6 +1379,12 @@ def _call_lmstudio(
         .get("content", "")
         .strip()
     )
+    logger.debug(
+        "LM raw response: category=%s, chars=%s, content=%s",
+        category,
+        len(content),
+        _truncate_for_log(content),
+    )
     if not content:
         raise RuntimeError("LM Studio response content is empty")
 
@@ -1409,7 +1407,14 @@ def _call_lmstudio(
                 "sanitize_error": "fallback_applied_callsite",
             }
             logger.warning("JSON parse fallback applied at call-site")
-    return json.dumps(parsed, ensure_ascii=False)
+    parsed_json_text = json.dumps(parsed, ensure_ascii=False)
+    logger.debug(
+        "LM parsed json: category=%s, chars=%s, json=%s",
+        category,
+        len(parsed_json_text),
+        _truncate_for_log(parsed_json_text),
+    )
+    return parsed_json_text
 
 
 def _process_single_record_for_lm(
@@ -1570,6 +1575,13 @@ def process_pending_records_with_lmstudio(
                             table_name=table_name,
                             record_id=record_id,
                         )
+                        logger.debug(
+                            "LM save payload: table=%s, id=%s, chars=%s, json=%s",
+                            table_name,
+                            record_id,
+                            len(json_text),
+                            _truncate_for_log(json_text),
+                        )
                         update_record_json_status_and_properties(
                             conn=conn,
                             table_name=table_name,
@@ -1578,6 +1590,8 @@ def process_pending_records_with_lmstudio(
                             properties=first_obj,
                             status="1",
                         )
+                        # 障害時の取りこぼしを避けるため、成功レコードごとに確定する。
+                        conn.commit()
                         total_success += 1
                         if table_name == "mails_talent":
                             success_talent += 1
@@ -1600,8 +1614,6 @@ def process_pending_records_with_lmstudio(
                         )
                         time.sleep(interval_rest_seconds)
                         interval_start_time = time.monotonic()
-
-        conn.commit()
 
     logger.info(f"LM後処理完了: success={total_success}, error={total_error}")
 
