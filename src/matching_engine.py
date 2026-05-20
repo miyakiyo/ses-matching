@@ -2,6 +2,7 @@ import json
 import sqlite3
 import re
 import logging
+from datetime import datetime
 from time import perf_counter
 from typing import Optional, Tuple
 from .database_utils import (
@@ -9,6 +10,8 @@ from .database_utils import (
     get_project_record,
     add_match,
     check_existing_match,
+    get_changed_record_ids_since,
+    delete_matches_for_non_active_records,
 )
 
 
@@ -16,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 # 全組み合わせスキャン時の進捗ログ間隔（組み合わせ数）。
 MATCH_PROGRESS_LOG_INTERVAL = 1000
+MATCH_DETAILED_LOG_INTERVAL = 1000
 
 
 def _normalize_list_value(field, split_plain_text: bool = True) -> list[str]:
@@ -558,15 +562,29 @@ def _is_same_sender(talent_record: dict, project_record: dict) -> bool:
     return False
 
 
-def process_all_matches(conn: sqlite3.Connection) -> dict:
+def process_all_matches(
+    conn: sqlite3.Connection,
+    log_interval_pairs: int = MATCH_PROGRESS_LOG_INTERVAL,
+    detailed_log_interval_pairs: int = MATCH_DETAILED_LOG_INTERVAL,
+    incremental_mode: bool = False,
+    incremental_since: Optional[datetime] = None,
+) -> dict:
     """全人材×全案件をスキャンして、マッチング処理を実行します。
 
     処理完了した人材・案件レコード（status='1'）のみを対象とします。
 
     :param conn: SQLiteコネクション。
+    :param incremental_mode: True のとき差分対象のみを再計算します。
+    :param incremental_since: 差分判定の基準時刻（UTC）。
     :return: 処理統計 {"total_matches": int, "added": int, "updated": int} の辞書。
     """
     started_at = perf_counter()
+    normalized_log_interval = max(1, int(log_interval_pairs or MATCH_PROGRESS_LOG_INTERVAL))
+    normalized_detailed_log_interval = max(
+        1,
+        int(detailed_log_interval_pairs or MATCH_DETAILED_LOG_INTERVAL),
+    )
+
     stats = {
         "fetch_ids_seconds": 0.0,
         "fetch_talent_seconds": 0.0,
@@ -575,6 +593,11 @@ def process_all_matches(conn: sqlite3.Connection) -> dict:
         "score_calc_seconds": 0.0,
         "check_existing_seconds": 0.0,
         "add_match_seconds": 0.0,
+        "add_match_execute_seconds": 0.0,
+        "add_match_commit_seconds": 0.0,
+        "add_match_fetch_id_seconds": 0.0,
+        "fetch_changed_ids_seconds": 0.0,
+        "cleanup_inactive_matches_seconds": 0.0,
         "loop_seconds": 0.0,
         "missing_talent_records": 0,
         "missing_project_records": 0,
@@ -593,30 +616,110 @@ def process_all_matches(conn: sqlite3.Connection) -> dict:
     
     talent_ids = [row[0] for row in talent_rows]
     project_ids = [row[0] for row in project_rows]
+
+    changed_talent_ids: list[int] = []
+    changed_project_ids: list[int] = []
+    deleted_inactive_matches = 0
+    target_projects_by_talent: dict[int, set[int]] = {}
+
+    if incremental_mode and incremental_since:
+        cleanup_started = perf_counter()
+        deleted_inactive_matches = delete_matches_for_non_active_records(conn)
+        stats["cleanup_inactive_matches_seconds"] = perf_counter() - cleanup_started
+
+        changed_started = perf_counter()
+        changed_talent_ids = get_changed_record_ids_since(
+            conn,
+            "mails_talent",
+            incremental_since,
+        )
+        changed_project_ids = get_changed_record_ids_since(
+            conn,
+            "mails_project",
+            incremental_since,
+        )
+        stats["fetch_changed_ids_seconds"] = perf_counter() - changed_started
+
+        for talent_id in changed_talent_ids:
+            target_projects_by_talent.setdefault(talent_id, set()).update(project_ids)
+        if changed_project_ids:
+            for talent_id in talent_ids:
+                target_projects_by_talent.setdefault(talent_id, set()).update(changed_project_ids)
+
+        candidate_pairs = sum(len(project_set) for project_set in target_projects_by_talent.values())
+        logger.info(
+            "マッチング計測開始: mode=incremental, since=%s, talent=%s, project=%s, changed_talent=%s, changed_project=%s, candidate_pairs=%s, removed_inactive_matches=%s, log_interval=%s, detailed_interval=%s",
+            incremental_since.isoformat(),
+            len(talent_ids),
+            len(project_ids),
+            len(changed_talent_ids),
+            len(changed_project_ids),
+            candidate_pairs,
+            deleted_inactive_matches,
+            normalized_log_interval,
+            normalized_detailed_log_interval,
+        )
+    else:
+        for talent_id in talent_ids:
+            target_projects_by_talent[talent_id] = set(project_ids)
+
+        logger.info(
+            "マッチング計測開始: mode=full, talent=%s, project=%s, potential_pairs=%s, log_interval=%s, detailed_interval=%s",
+            len(talent_ids),
+            len(project_ids),
+            len(talent_ids) * len(project_ids),
+            normalized_log_interval,
+            normalized_detailed_log_interval,
+        )
+
+    if incremental_mode and incremental_since and not target_projects_by_talent:
+        total_elapsed = perf_counter() - started_at
+        logger.info(
+            "マッチング計測結果: mode=incremental, since=%s, total_elapsed=%.2fs, scanned=0, effective=0, added=0, updated=0, changed_talent=0, changed_project=0, removed_inactive_matches=%s",
+            incremental_since.isoformat(),
+            total_elapsed,
+            deleted_inactive_matches,
+        )
+        return {
+            "total_matches": 0,
+            "added": 0,
+            "updated": 0,
+            "same_sender_skipped": 0,
+            "timings": {
+                "total_elapsed_seconds": total_elapsed,
+                "fetch_ids_seconds": stats["fetch_ids_seconds"],
+                "fetch_talent_seconds": 0.0,
+                "fetch_project_seconds": 0.0,
+                "same_sender_check_seconds": 0.0,
+                "score_calc_seconds": 0.0,
+                "check_existing_seconds": 0.0,
+                "add_match_seconds": 0.0,
+                "add_match_execute_seconds": 0.0,
+                "add_match_commit_seconds": 0.0,
+                "add_match_fetch_id_seconds": 0.0,
+                "fetch_changed_ids_seconds": stats["fetch_changed_ids_seconds"],
+                "cleanup_inactive_matches_seconds": stats["cleanup_inactive_matches_seconds"],
+                "loop_seconds": 0.0,
+            },
+        }
     
     total_matches = 0
     matches_added = 0
     matches_updated = 0
     same_sender_skipped = 0
+    zero_score_skipped = 0
 
-    logger.info(
-        "マッチング計測開始: talent=%s, project=%s, potential_pairs=%s",
-        len(talent_ids),
-        len(project_ids),
-        len(talent_ids) * len(project_ids),
-    )
-    
-    # 全組み合わせをスキャン
+    # 全組み合わせ（または差分対象ペア）をスキャン
     loop_started = perf_counter()
-    for talent_id in talent_ids:
+    for talent_id, project_id_set in sorted(target_projects_by_talent.items()):
         talent_fetch_started = perf_counter()
         talent_record = get_talent_record(conn, talent_id)
         stats["fetch_talent_seconds"] += perf_counter() - talent_fetch_started
         if not talent_record:
             stats["missing_talent_records"] += 1
             continue
-        
-        for project_id in project_ids:
+
+        for project_id in sorted(project_id_set):
             project_fetch_started = perf_counter()
             project_record = get_project_record(conn, project_id)
             stats["fetch_project_seconds"] += perf_counter() - project_fetch_started
@@ -633,16 +736,18 @@ def process_all_matches(conn: sqlite3.Connection) -> dict:
                 same_sender_skipped += 1
 
                 if (
-                    stats["pairs_scanned"] % MATCH_PROGRESS_LOG_INTERVAL == 0
+                    stats["pairs_scanned"] % normalized_log_interval == 0
                     and stats["pairs_scanned"] > 0
                 ):
                     elapsed = perf_counter() - started_at
+                    avg_scanned_ms = (elapsed / stats["pairs_scanned"]) * 1000
                     logger.info(
-                        "マッチング進捗: scanned=%s, effective=%s, skipped_same_sender=%s, elapsed=%.2fs",
+                        "マッチング進捗: scanned=%s, effective=%s, skipped_same_sender=%s, elapsed=%.2fs, avg_scanned_ms=%.3f",
                         stats["pairs_scanned"],
                         total_matches,
                         same_sender_skipped,
                         elapsed,
+                        avg_scanned_ms,
                     )
                 continue
             stats["same_sender_check_seconds"] += perf_counter() - same_sender_started
@@ -653,6 +758,11 @@ def process_all_matches(conn: sqlite3.Connection) -> dict:
             score_started = perf_counter()
             score, reason = calculate_match_score(talent_record, project_record)
             stats["score_calc_seconds"] += perf_counter() - score_started
+
+            # スコア0は保存対象外とする。
+            if score <= 0:
+                zero_score_skipped += 1
+                continue
             
             # マッチング結果を保存
             existing_started = perf_counter()
@@ -660,8 +770,11 @@ def process_all_matches(conn: sqlite3.Connection) -> dict:
             stats["check_existing_seconds"] += perf_counter() - existing_started
 
             add_started = perf_counter()
-            add_match(conn, talent_id, project_id, score, reason)
+            _, add_timings = add_match(conn, talent_id, project_id, score, reason)
             stats["add_match_seconds"] += perf_counter() - add_started
+            stats["add_match_execute_seconds"] += add_timings.get("execute_seconds", 0.0)
+            stats["add_match_commit_seconds"] += add_timings.get("commit_seconds", 0.0)
+            stats["add_match_fetch_id_seconds"] += add_timings.get("fetch_id_seconds", 0.0)
             
             if existing:
                 matches_updated += 1
@@ -669,41 +782,75 @@ def process_all_matches(conn: sqlite3.Connection) -> dict:
                 matches_added += 1
 
             if (
-                stats["pairs_scanned"] % MATCH_PROGRESS_LOG_INTERVAL == 0
+                total_matches > 0
+                and total_matches % normalized_detailed_log_interval == 0
+            ):
+                logger.info(
+                    "マッチング詳細: scanned=%s, effective=%s, talent_id=%s, project_id=%s, score=%s, existing=%s, add_exec_ms=%.3f, add_commit_ms=%.3f, add_fetch_id_ms=%.3f, score_calc_ms=%.3f, check_existing_ms=%.3f",
+                    stats["pairs_scanned"],
+                    total_matches,
+                    talent_id,
+                    project_id,
+                    score,
+                    existing,
+                    add_timings.get("execute_seconds", 0.0) * 1000,
+                    add_timings.get("commit_seconds", 0.0) * 1000,
+                    add_timings.get("fetch_id_seconds", 0.0) * 1000,
+                    (stats["score_calc_seconds"] / total_matches) * 1000,
+                    (stats["check_existing_seconds"] / total_matches) * 1000,
+                )
+
+            if (
+                stats["pairs_scanned"] % normalized_log_interval == 0
                 and stats["pairs_scanned"] > 0
             ):
                 elapsed = perf_counter() - started_at
+                avg_effective_ms = (elapsed / total_matches) * 1000 if total_matches > 0 else 0.0
                 logger.info(
-                    "マッチング進捗: scanned=%s, effective=%s, skipped_same_sender=%s, added=%s, updated=%s, elapsed=%.2fs",
+                    "マッチング進捗: scanned=%s, effective=%s, skipped_same_sender=%s, skipped_zero_score=%s, added=%s, updated=%s, elapsed=%.2fs, avg_effective_ms=%.3f, add_commit_avg_ms=%.3f",
                     stats["pairs_scanned"],
                     total_matches,
                     same_sender_skipped,
+                    zero_score_skipped,
                     matches_added,
                     matches_updated,
                     elapsed,
+                    avg_effective_ms,
+                    (stats["add_match_commit_seconds"] / total_matches) * 1000 if total_matches > 0 else 0.0,
                 )
 
     stats["loop_seconds"] = perf_counter() - loop_started
     total_elapsed = perf_counter() - started_at
 
     logger.info(
-        "マッチング計測結果: total_elapsed=%.2fs, loop=%.2fs, fetch_ids=%.2fs, fetch_talent=%.2fs, fetch_project=%.2fs, same_sender=%.2fs, score_calc=%.2fs, check_existing=%.2fs, add_match=%.2fs, scanned=%s, effective=%s, added=%s, updated=%s, skipped_same_sender=%s, missing_talent=%s, missing_project=%s",
+        "マッチング計測結果: mode=%s, since=%s, total_elapsed=%.2fs, loop=%.2fs, fetch_ids=%.2fs, fetch_changed=%.2fs, cleanup_inactive=%.2fs, fetch_talent=%.2fs, fetch_project=%.2fs, same_sender=%.2fs, score_calc=%.2fs, check_existing=%.2fs, add_match=%.2fs, add_match_execute=%.2fs, add_match_commit=%.2fs, add_match_fetch_id=%.2fs, scanned=%s, effective=%s, added=%s, updated=%s, skipped_same_sender=%s, skipped_zero_score=%s, missing_talent=%s, missing_project=%s, changed_talent=%s, changed_project=%s, removed_inactive_matches=%s",
+        "incremental" if incremental_mode else "full",
+        incremental_since.isoformat() if incremental_since else "none",
         total_elapsed,
         stats["loop_seconds"],
         stats["fetch_ids_seconds"],
+        stats["fetch_changed_ids_seconds"],
+        stats["cleanup_inactive_matches_seconds"],
         stats["fetch_talent_seconds"],
         stats["fetch_project_seconds"],
         stats["same_sender_check_seconds"],
         stats["score_calc_seconds"],
         stats["check_existing_seconds"],
         stats["add_match_seconds"],
+        stats["add_match_execute_seconds"],
+        stats["add_match_commit_seconds"],
+        stats["add_match_fetch_id_seconds"],
         stats["pairs_scanned"],
         total_matches,
         matches_added,
         matches_updated,
         same_sender_skipped,
+        zero_score_skipped,
         stats["missing_talent_records"],
         stats["missing_project_records"],
+        len(changed_talent_ids),
+        len(changed_project_ids),
+        deleted_inactive_matches,
     )
     
     return {
@@ -711,6 +858,7 @@ def process_all_matches(conn: sqlite3.Connection) -> dict:
         "added": matches_added,
         "updated": matches_updated,
         "same_sender_skipped": same_sender_skipped,
+        "zero_score_skipped": zero_score_skipped,
         "timings": {
             "total_elapsed_seconds": total_elapsed,
             "fetch_ids_seconds": stats["fetch_ids_seconds"],
@@ -720,6 +868,11 @@ def process_all_matches(conn: sqlite3.Connection) -> dict:
             "score_calc_seconds": stats["score_calc_seconds"],
             "check_existing_seconds": stats["check_existing_seconds"],
             "add_match_seconds": stats["add_match_seconds"],
+            "add_match_execute_seconds": stats["add_match_execute_seconds"],
+            "add_match_commit_seconds": stats["add_match_commit_seconds"],
+            "add_match_fetch_id_seconds": stats["add_match_fetch_id_seconds"],
+            "fetch_changed_ids_seconds": stats["fetch_changed_ids_seconds"],
+            "cleanup_inactive_matches_seconds": stats["cleanup_inactive_matches_seconds"],
             "loop_seconds": stats["loop_seconds"],
         },
     }

@@ -6,7 +6,16 @@ import yaml
 import logging
 from pathlib import Path
 
-from src.database_utils import init_db, get_last_run_at, record_run_at, delete_old_records, export_tables_to_csv
+from src.database_utils import (
+    init_db,
+    get_last_run_at,
+    record_run_at,
+    get_last_matching_run_at,
+    record_matching_run_at,
+    expire_matching_target_records,
+    delete_old_records,
+    export_tables_to_csv,
+)
 from src.classifier_utils import classify_ses_subject, append_unclassified_log
 from src.graph_mail import get_mail_subjects, list_mail_folders
 from src.postprocess_lmstudio import process_pending_records_with_lmstudio
@@ -311,6 +320,7 @@ def _run_lm_postprocess(conn, run_talent: bool = True, run_project: bool = True)
     lmstudio_greeting_trim_chars = max(0, int(config.get('lmstudio', {}).get('greeting_trim_chars', 100)))
     lmstudio_interval_work_seconds = max(0, int(config.get('lmstudio', {}).get('interval_work_seconds', 0)))
     lmstudio_interval_rest_seconds = max(0, int(config.get('lmstudio', {}).get('interval_rest_seconds', 30)))
+    lmstudio_reload_interval_seconds = max(0, int(config.get('lmstudio', {}).get('reload_interval_seconds', 900)))
     lm_exclude_folders_talent = [str(name).strip() for name in LM_EXCLUDE_FOLDERS_TALENT if str(name).strip()]
     lm_exclude_folders_project = [str(name).strip() for name in LM_EXCLUDE_FOLDERS_PROJECT if str(name).strip()]
     enabled_tables = []
@@ -336,6 +346,7 @@ def _run_lm_postprocess(conn, run_talent: bool = True, run_project: bool = True)
         greeting_trim_chars=lmstudio_greeting_trim_chars,
         interval_work_seconds=lmstudio_interval_work_seconds,
         interval_rest_seconds=lmstudio_interval_rest_seconds,
+        reload_interval_seconds=lmstudio_reload_interval_seconds,
     )
     logger.info(f'LM後処理結果: success={lm_success}, error={lm_error}')
     return lm_success, lm_error, lm_success_talent, lm_success_project
@@ -351,7 +362,15 @@ def _run_delete_old_records(conn) -> tuple[int, int, int]:
 def _run_csv_export(conn) -> None:
     """CSV出力を実行します。"""
     csv_output_dir = config.get('mailbox', {}).get('csv_output_dir', 'csv_exports')
-    exported_files = export_tables_to_csv(conn, csv_output_dir)
+    include_matches_joined = config.get('mailbox', {}).get('export_matches_joined_csv', True)
+    if not isinstance(include_matches_joined, bool):
+        logger.warning('config.mailbox.export_matches_joined_csv は bool を指定してください。default=true を使用します。')
+        include_matches_joined = True
+    exported_files = export_tables_to_csv(
+        conn,
+        csv_output_dir,
+        include_matches_joined=include_matches_joined,
+    )
     for exported_file in exported_files:
         logger.info(f'CSV出力完了: {exported_file}')
 
@@ -359,17 +378,46 @@ def _run_csv_export(conn) -> None:
 def _run_matching_only(conn) -> dict[str, int]:
     """マッチング処理のみを実行します。"""
     from src.matching_engine import process_all_matches
+    matching_config = config.get('matching', {})
+    ses_config = config.get('ses', {})
+    matching_log_interval_pairs = int(matching_config.get('log_interval_pairs', 1000))
+    matching_detailed_log_interval_pairs = int(matching_config.get('detailed_log_interval_pairs', 1000))
+    matching_expire_hours = max(0, int(ses_config.get('matching_expire_hours', 120)))
+    raw_incremental = matching_config.get('incremental', True)
+    matching_incremental = raw_incremental if isinstance(raw_incremental, bool) else True
+    if not isinstance(raw_incremental, bool):
+        logger.warning('config.matching.incremental は bool を指定してください。default=true を使用します。')
+    incremental_since = get_last_matching_run_at(conn) if matching_incremental else None
+
+    expired_talent, expired_project = expire_matching_target_records(
+        conn,
+        expire_hours=matching_expire_hours,
+    )
+    logger.info(
+        f'マッチング期限更新: hours={matching_expire_hours}, '
+        f'expired_talent={expired_talent}, expired_project={expired_project}'
+    )
     
     logger.info('マッチング処理開始...')
     try:
-        match_stats = process_all_matches(conn)
+        match_stats = process_all_matches(
+            conn,
+            log_interval_pairs=matching_log_interval_pairs,
+            detailed_log_interval_pairs=matching_detailed_log_interval_pairs,
+            incremental_mode=matching_incremental,
+            incremental_since=incremental_since,
+        )
+        record_matching_run_at(conn, datetime.now(timezone.utc))
         timings = match_stats.get('timings', {})
         logger.info(
             f'マッチング処理完了: total={match_stats["total_matches"]}, '
             f'added={match_stats["added"]}, updated={match_stats["updated"]}, '
+            f'incremental={matching_incremental}, '
+            f'expired_talent={expired_talent}, expired_project={expired_project}, '
             f'total_elapsed={timings.get("total_elapsed_seconds", 0):.2f}s, '
             f'score_calc={timings.get("score_calc_seconds", 0):.2f}s, '
-            f'add_match={timings.get("add_match_seconds", 0):.2f}s'
+            f'add_match={timings.get("add_match_seconds", 0):.2f}s, '
+            f'add_commit={timings.get("add_match_commit_seconds", 0):.2f}s'
         )
         return match_stats
     except Exception as e:

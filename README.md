@@ -48,7 +48,16 @@ processes:
 | `1` | LM処理済み |
 | `2` | mails_talent 保存時に `ses.status2_keywords` に一致したレコード |
 | `3` | mails_talent / mails_project 保存時に、同一テーブル内の `status=1` レコードと重複条件（folder+subject または sender_addr+subject）に一致し、`ses.status3_window_hours` 以内だったレコード |
+| `4` | mails_talent / mails_project の `status=1` レコードのうち、`received_at` から `ses.matching_expire_hours` を超過し、マッチング対象外になったレコード |
 
 補足:
 - LM処理は `status=0` のみを対象にします。
+- マッチング処理は `status=1` のみを対象にし、実行前に `received_at` が `ses.matching_expire_hours`（既定120時間）を超過したものを `status=4` に更新して対象外にします。
 - 実行結果の件数ログ（`logs/result_counts.log`）には、メール取得成功時に `status2` と `status3` の新規保存件数も出力されます。
+
+## status4 設定
+
+```yaml
+ses:
+  matching_expire_hours: 120  # status=1 を status=4 にするまでの経過時間（時間）
+```

@@ -1,6 +1,7 @@
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
+from time import perf_counter
 import csv
 import json
 import logging
@@ -62,6 +63,18 @@ def _convert_row_datetimes_for_csv(column_names: list[str], row: tuple) -> list[
     return converted
 
 
+def _ensure_columns_exist(conn: sqlite3.Connection, table_name: str, columns: list[tuple[str, str]]) -> None:
+    """テーブルに不足している列を追加します。"""
+    existing_columns = {
+        row[1]
+        for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+    for column_name, column_definition in columns:
+        if column_name in existing_columns:
+            continue
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_definition}")
+
+
 def init_db(db_path: str = "DB/mails.db") -> sqlite3.Connection:
     """アプリで利用するSQLiteテーブルを初期化します。
 
@@ -84,6 +97,17 @@ def init_db(db_path: str = "DB/mails.db") -> sqlite3.Connection:
         conn.execute("ALTER TABLE matches_human_case RENAME TO matches")
     if "matches_talent_project" in existing_tables and "matches" not in existing_tables:
         conn.execute("ALTER TABLE matches_talent_project RENAME TO matches")
+
+    _ensure_columns_exist(
+        conn,
+        "mails_project",
+        [
+            ("単価下限", '"単価下限" TEXT'),
+            ("単価上限", '"単価上限" TEXT'),
+            ("年齢下限", '"年齢下限" TEXT'),
+            ("年齢上限", '"年齢上限" TEXT'),
+        ],
+    )
 
     # 旧カラム名が残っている場合に project/talent へ移行する。
     match_columns = {
@@ -164,15 +188,16 @@ def init_db(db_path: str = "DB/mails.db") -> sqlite3.Connection:
             "求める人物像" TEXT,
             "時期"      TEXT,
             "契約期間"  TEXT,
-            "単価下限"  REAL,
-            "単価上限"  REAL,
+            "単価"      TEXT,
+            "単価下限"  TEXT,
+            "単価上限"  TEXT,
             "稼働率"    TEXT,
             "精算"      TEXT,
             "面談"      TEXT,
             "募集人数"  TEXT,
             "年齢"      TEXT,
-            "年齢下限"  INTEGER,
-            "年齢上限"  INTEGER,
+            "年齢下限"  TEXT,
+            "年齢上限"  TEXT,
             "外国籍可否" TEXT,
             "個人事業主可否" TEXT,
             "契約形態"  TEXT,
@@ -188,6 +213,16 @@ def init_db(db_path: str = "DB/mails.db") -> sqlite3.Connection:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS run_history (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_at     TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS matching_run_history (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             run_at     TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -215,37 +250,39 @@ def init_db(db_path: str = "DB/mails.db") -> sqlite3.Connection:
     )
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS matches (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            talent_id   INTEGER NOT NULL,
-            project_id    INTEGER NOT NULL,
-            score      INTEGER NOT NULL DEFAULT 0,
-            reason     TEXT,
-            status     VARCHAR(1) NOT NULL DEFAULT '0',
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (talent_id) REFERENCES mails_talent(id),
-            FOREIGN KEY (project_id) REFERENCES mails_project(id),
-            UNIQUE(talent_id, project_id)
+        CREATE TABLE IF NOT EXISTS matches( 
+            id INTEGER PRIMARY KEY AUTOINCREMENT
+            , talent_id INTEGER NOT NULL
+            , project_id INTEGER NOT NULL
+            , score INTEGER NOT NULL DEFAULT 0
+            , reason TEXT
+            , status VARCHAR (1) NOT NULL DEFAULT '0'
+            , created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            , updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            , UNIQUE (talent_id, project_id)
         )
         """
     )
 
-    # 既存DBに年齢下限/上限カラムが無い場合は追加する。
-    project_columns = {
-        row[1]
-        for row in conn.execute("PRAGMA table_info(mails_project)").fetchall()
-    }
-    if "単価下限" not in project_columns:
-        conn.execute('ALTER TABLE mails_project ADD COLUMN "単価下限" REAL')
-    if "単価上限" not in project_columns:
-        conn.execute('ALTER TABLE mails_project ADD COLUMN "単価上限" REAL')
-    if "年齢下限" not in project_columns:
-        conn.execute('ALTER TABLE mails_project ADD COLUMN "年齢下限" INTEGER')
-    if "年齢上限" not in project_columns:
-        conn.execute('ALTER TABLE mails_project ADD COLUMN "年齢上限" INTEGER')
-
-    conn.commit()
+    # 差分マッチングの検索速度を安定化するインデックス。
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_mails_talent_status_updated_id
+        ON mails_talent(status, updated_at, id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_mails_project_status_updated_id
+        ON mails_project(status, updated_at, id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_matches_talent_project_updated
+        ON matches(talent_id, project_id, updated_at)
+        """
+    )
     return conn
 
 
@@ -277,6 +314,119 @@ def record_run_at(conn: sqlite3.Connection, run_at: datetime) -> None:
     run_at_utc = run_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     conn.execute("INSERT INTO run_history (run_at) VALUES (?)", (run_at_utc,))
     conn.commit()
+
+
+def get_last_matching_run_at(conn: sqlite3.Connection) -> Optional[datetime]:
+    """前回のマッチング実行時刻を取得します。"""
+    row = conn.execute(
+        "SELECT run_at FROM matching_run_history ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if not row or not row[0]:
+        return None
+    try:
+        return datetime.fromisoformat(str(row[0]).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def record_matching_run_at(conn: sqlite3.Connection, run_at: datetime) -> None:
+    """マッチング実行時刻を履歴テーブルに保存します。"""
+    run_at_utc = run_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    conn.execute("INSERT INTO matching_run_history (run_at) VALUES (?)", (run_at_utc,))
+    conn.commit()
+
+
+def _to_sqlite_utc_timestamp(dt: datetime) -> str:
+    """UTC datetime を SQLite CURRENT_TIMESTAMP 互換の文字列へ変換します。"""
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_changed_record_ids_since(
+    conn: sqlite3.Connection,
+    table_name: str,
+    since: datetime,
+) -> list[int]:
+    """基準時刻以降に更新された status='1' レコードIDを取得します。"""
+    if table_name not in ("mails_talent", "mails_project"):
+        raise ValueError("table_name must be either 'mails_talent' or 'mails_project'")
+
+    since_text = _to_sqlite_utc_timestamp(since)
+    rows = conn.execute(
+        f"""
+        SELECT id
+        FROM {table_name}
+        WHERE status = '1'
+          AND updated_at >= ?
+        ORDER BY id
+        """,
+        (since_text,),
+    ).fetchall()
+    return [row[0] for row in rows]
+
+
+def delete_matches_for_non_active_records(conn: sqlite3.Connection) -> int:
+    """status='1' ではない人材/案件に紐づく matches を削除します。"""
+    cursor = conn.execute(
+        """
+        DELETE FROM matches
+        WHERE talent_id IN (
+            SELECT id FROM mails_talent WHERE status != '1'
+        )
+        OR project_id IN (
+            SELECT id FROM mails_project WHERE status != '1'
+        )
+        """
+    )
+    deleted = cursor.rowcount if cursor.rowcount is not None else 0
+    conn.commit()
+    return deleted
+
+
+def expire_matching_target_records(
+    conn: sqlite3.Connection,
+    expire_hours: int,
+) -> tuple[int, int]:
+    """status='1' の期限超過レコードを status='4' へ更新します。
+
+    :param conn: SQLiteコネクション。
+    :param expire_hours: 期限時間（時間）。0以下は無効。
+    :return: (更新した mails_talent 件数, 更新した mails_project 件数) のタプル。
+    """
+    normalized_hours = max(0, int(expire_hours or 0))
+    if normalized_hours <= 0:
+        return (0, 0)
+
+    cutoff_dt = datetime.now(timezone.utc) - timedelta(hours=normalized_hours)
+    cutoff_str = _to_sqlite_utc_timestamp(cutoff_dt)
+
+    talent_cursor = conn.execute(
+        """
+        UPDATE mails_talent
+        SET status = '4',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE status = '1'
+          AND received_at IS NOT NULL
+          AND datetime(received_at) <= datetime(?)
+        """,
+        (cutoff_str,),
+    )
+    expired_talent = talent_cursor.rowcount if talent_cursor.rowcount is not None else 0
+
+    project_cursor = conn.execute(
+        """
+        UPDATE mails_project
+        SET status = '4',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE status = '1'
+          AND received_at IS NOT NULL
+          AND datetime(received_at) <= datetime(?)
+        """,
+        (cutoff_str,),
+    )
+    expired_project = project_cursor.rowcount if project_cursor.rowcount is not None else 0
+
+    conn.commit()
+    return (expired_talent, expired_project)
 
 
 def delete_old_records(conn: sqlite3.Connection, days: int = 7) -> tuple:
@@ -328,7 +478,11 @@ def delete_old_records(conn: sqlite3.Connection, days: int = 7) -> tuple:
     return (deleted_talent, deleted_project, deleted_history)
 
 
-def export_tables_to_csv(conn: sqlite3.Connection, output_dir: str = "csv_exports") -> list[str]:
+def export_tables_to_csv(
+    conn: sqlite3.Connection,
+    output_dir: str = "csv_exports",
+    include_matches_joined: bool = True,
+) -> list[str]:
     """各テーブルの内容をCSVファイルへ出力します。
 
     DB内部値はUTCのまま保持し、CSVでは日時カラムのみJSTに変換して出力します。
@@ -358,46 +512,47 @@ def export_tables_to_csv(conn: sqlite3.Connection, output_dir: str = "csv_export
 
         exported_files.append(str(csv_path))
 
-    # matches_joined.csv: matchesテーブルをmails_talentとmails_projectと連結したCSV
-    joined_cursor = conn.execute(
-        """
-        SELECT
-            t.folder AS talent_folder,
-            t.subject AS talent_subject,
-            t.body AS talent_body,
-            t.received_at AS talent_received_at,
-            p.folder AS project_folder,
-            p.subject AS project_subject,
-            p.body AS project_body,
-            p.received_at AS project_received_at,
-            m.score AS score
-        FROM matches AS m
-        LEFT JOIN mails_talent AS t ON t.id = m.talent_id
-        LEFT JOIN mails_project AS p ON p.id = m.project_id
-        ORDER BY m.score DESC, m.id DESC
-        """
-    )
-    joined_rows = joined_cursor.fetchall()
+    if include_matches_joined:
+        # matches_joined.csv: matchesテーブルをmails_talentとmails_projectと連結したCSV
+        joined_cursor = conn.execute(
+            """
+            SELECT
+                t.folder AS talent_folder,
+                t.subject AS talent_subject,
+                t.body AS talent_body,
+                t.received_at AS talent_received_at,
+                p.folder AS project_folder,
+                p.subject AS project_subject,
+                p.body AS project_body,
+                p.received_at AS project_received_at,
+                m.score AS score
+            FROM matches AS m
+            LEFT JOIN mails_talent AS t ON t.id = m.talent_id
+            LEFT JOIN mails_project AS p ON p.id = m.project_id
+            ORDER BY m.score DESC, m.id DESC
+            """
+        )
+        joined_rows = joined_cursor.fetchall()
 
-    joined_csv_path = output_path / "matches_joined.csv"
-    with joined_csv_path.open("w", newline="", encoding="utf-8-sig") as csv_file:
-        writer = csv.writer(csv_file)
-        joined_columns = [
-                "talent_folder",
-                "talent_subject",
-                "talent_body",
-                "talent_received_at",
-                "project_folder",
-                "project_subject",
-                "project_body",
-                "project_received_at",
-                "score",
-        ]
-        writer.writerow(joined_columns)
-        for row in joined_rows:
-            writer.writerow(_convert_row_datetimes_for_csv(joined_columns, row))
+        joined_csv_path = output_path / "matches_joined.csv"
+        with joined_csv_path.open("w", newline="", encoding="utf-8-sig") as csv_file:
+            writer = csv.writer(csv_file)
+            joined_columns = [
+                    "talent_folder",
+                    "talent_subject",
+                    "talent_body",
+                    "talent_received_at",
+                    "project_folder",
+                    "project_subject",
+                    "project_body",
+                    "project_received_at",
+                    "score",
+            ]
+            writer.writerow(joined_columns)
+            for row in joined_rows:
+                writer.writerow(_convert_row_datetimes_for_csv(joined_columns, row))
 
-    exported_files.append(str(joined_csv_path))
+        exported_files.append(str(joined_csv_path))
 
     return exported_files
 
@@ -569,7 +724,7 @@ def add_match(
     project_id: int,
     score: int,
     reason: dict,
-) -> int:
+) -> tuple[int, dict[str, float]]:
     """マッチング結果を matches テーブルに追加または更新します。
 
     :param conn: SQLiteコネクション。
@@ -577,11 +732,19 @@ def add_match(
     :param project_id: 案件ID。
     :param score: マッチングスコア（0-100）。
     :param reason: マッチング理由（JSON辞書）。
-    :return: 挿入または更新されたレコードID。
+    :return: (挿入または更新されたレコードID, 処理時間内訳)。
     """
     reason_json = json.dumps(reason, ensure_ascii=False)
+    timings = {
+        "execute_seconds": 0.0,
+        "commit_seconds": 0.0,
+        "fetch_id_seconds": 0.0,
+        "total_seconds": 0.0,
+    }
+    total_started = perf_counter()
     
     # UNIQUE 制約により、既存レコードは UPDATE、新規は INSERT される
+    execute_started = perf_counter()
     conn.execute(
         """
         INSERT INTO matches (talent_id, project_id, score, reason, status, created_at, updated_at)
@@ -593,13 +756,20 @@ def add_match(
         """,
         (talent_id, project_id, score, reason_json),
     )
+    timings["execute_seconds"] = perf_counter() - execute_started
+
+    commit_started = perf_counter()
     conn.commit()
+    timings["commit_seconds"] = perf_counter() - commit_started
     
+    fetch_started = perf_counter()
     result = conn.execute(
         "SELECT id FROM matches WHERE talent_id = ? AND project_id = ?",
         (talent_id, project_id),
     ).fetchone()
-    return result[0] if result else -1
+    timings["fetch_id_seconds"] = perf_counter() - fetch_started
+    timings["total_seconds"] = perf_counter() - total_started
+    return (result[0] if result else -1, timings)
 
 
 def get_all_matches(conn: sqlite3.Connection, limit: int = None) -> list[dict]:

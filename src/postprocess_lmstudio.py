@@ -2,11 +2,13 @@ import csv
 import json
 import logging
 import re
+import threading
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 import sqlite3
@@ -16,6 +18,10 @@ from .matching_engine import process_all_matches
 
 
 logger = logging.getLogger(__name__)
+
+
+_LMSTUDIO_MODEL_RELOAD_LOCK = threading.Lock()
+_LMSTUDIO_LAST_RELOAD_MONOTONIC: float | None = None
 
 
 def _truncate_for_log(text: str, limit: int = 4000) -> str:
@@ -1226,6 +1232,94 @@ def _load_human_schema_text() -> str:
     return schema_path.read_text(encoding="utf-8")
 
 
+def _resolve_lmstudio_base_url(endpoint: str) -> str:
+    """chat/completions エンドポイントから LM Studio サーバーのベースURLを求める。"""
+    parsed = urlparse(endpoint)
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError(f"Invalid LM Studio endpoint: {endpoint}")
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _reload_lmstudio_model(endpoint: str, model: str, timeout: int) -> None:
+    """LM Studio のモデルを unload -> load して再ロードする。"""
+    base_url = _resolve_lmstudio_base_url(endpoint)
+    list_url = f"{base_url}/api/v1/models"
+    unload_url = f"{base_url}/api/v1/models/unload"
+    load_url = f"{base_url}/api/v1/models/load"
+
+    models_resp = requests.get(list_url, timeout=timeout)
+    models_resp.raise_for_status()
+    models = models_resp.json().get("models", [])
+
+    target_instance_ids: list[str] = []
+    for model_info in models:
+        if not isinstance(model_info, dict):
+            continue
+        key = str(model_info.get("key") or "")
+        selected_variant = str(model_info.get("selected_variant") or "")
+        loaded_instances = model_info.get("loaded_instances") or []
+        matches = key == model or selected_variant == model
+        if not matches:
+            for instance in loaded_instances:
+                if isinstance(instance, dict) and str(instance.get("id") or "") == model:
+                    matches = True
+                    break
+        if not matches:
+            continue
+
+        for instance in loaded_instances:
+            if not isinstance(instance, dict):
+                continue
+            instance_id = str(instance.get("id") or "").strip()
+            if instance_id:
+                target_instance_ids.append(instance_id)
+
+    for instance_id in target_instance_ids:
+        unload_resp = requests.post(
+            unload_url,
+            json={"instance_id": instance_id},
+            timeout=timeout,
+        )
+        unload_resp.raise_for_status()
+
+    load_resp = requests.post(
+        load_url,
+        json={"model": model},
+        timeout=timeout,
+    )
+    load_resp.raise_for_status()
+
+
+def _ensure_lmstudio_model_reloaded(
+    endpoint: str,
+    model: str,
+    timeout: int,
+    reload_interval_seconds: int,
+) -> None:
+    """必要なタイミングでLM Studioモデルを再ロードする。"""
+    global _LMSTUDIO_LAST_RELOAD_MONOTONIC
+
+    normalized_interval = max(0, int(reload_interval_seconds))
+    with _LMSTUDIO_MODEL_RELOAD_LOCK:
+        now = time.monotonic()
+        should_reload = _LMSTUDIO_LAST_RELOAD_MONOTONIC is None
+        if not should_reload and normalized_interval > 0:
+            elapsed = now - float(_LMSTUDIO_LAST_RELOAD_MONOTONIC)
+            should_reload = elapsed >= normalized_interval
+
+        if not should_reload:
+            return
+
+        logger.info(
+            "LM Studio model reload start: model=%s, interval_seconds=%s",
+            model,
+            normalized_interval,
+        )
+        _reload_lmstudio_model(endpoint=endpoint, model=model, timeout=timeout)
+        _LMSTUDIO_LAST_RELOAD_MONOTONIC = time.monotonic()
+        logger.info("LM Studio model reload complete: model=%s", model)
+
+
 def _call_lmstudio(
     endpoint: str,
     model: str,
@@ -1426,8 +1520,16 @@ def _process_single_record_for_lm(
     max_tokens: int,
     signature_trim_chars: int = 300,
     greeting_trim_chars: int = 100,
+    reload_interval_seconds: int = 900,
 ) -> tuple[str, dict[str, Any]]:
     """単一レコードのLM問い合わせ結果を返す（DB更新は行わない）。"""
+    _ensure_lmstudio_model_reloaded(
+        endpoint=endpoint,
+        model=model,
+        timeout=timeout,
+        reload_interval_seconds=reload_interval_seconds,
+    )
+
     attempt_max_tokens = max(1, int(max_tokens))
     last_error: Exception | None = None
     for attempt in range(3):
@@ -1493,6 +1595,7 @@ def process_pending_records_with_lmstudio(
     greeting_trim_chars: int = 100,
     interval_work_seconds: int = 0,
     interval_rest_seconds: int = 30,
+    reload_interval_seconds: int = 900,
 ) -> tuple[int, int, int, int]:
     """status='0' のレコードを LM Studio でJSON化して保存します。"""
     total_success = 0
@@ -1558,6 +1661,7 @@ def process_pending_records_with_lmstudio(
                         max_tokens,
                         signature_trim_chars,
                         greeting_trim_chars,
+                        reload_interval_seconds,
                     )
                     batch_futures[future] = record_id
                     futures[future] = record_id

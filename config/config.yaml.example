@@ -22,12 +22,19 @@ processes:
   delete_old: true  # 古いレコード削除を実行するか
   csv_export: true  # CSV出力を実行するか
 
+# マッチングログ設定
+matching:
+  incremental: true  # trueで前回マッチング実行以降の差分のみ再計算
+  log_interval_pairs: 1000  # 進捗ログを出す間隔（スキャン件数）
+  detailed_log_interval_pairs: 1000  # 詳細ログを出す間隔（有効マッチ件数）
+
 # SES分類キーワード
 ses:
   project_keywords: [案件, 募集, 急募, 増員, 交代枠, エンド直, 元請直, 現場直, 参画予定, 参画中, 【ARI】, 元請け直, 商流不問, 開始]  # 案件判定に使うキーワード
   talent_keywords: [人材, 要員, プロパー,技術者, 要員, 弊社所属, 弊社社員, 稼働可能, 参画可能, 待機, 空き, フリーランス, 即戦力, 個人事業主, 正社員, 懇意BP, 歳, 直個人]  # 人材判定に使うキーワード
-  status2_keywords: [１社下, 1社下, 中国籍, 韓国籍, ベトナム籍, 帰化]  # mails_talent 保存時に status=2 とするキーワード（件名/本文の部分一致）
-  status3_window_hours: 72  # status=3 重複判定の時間窓（時間）
+  status2_keywords: [一社下, 一社先, １社下, １社先, 1社下, 1社先, 懇意先, パートナー社員, コアパートナー, グループ会社社員, 中国籍, 韓国籍, ベトナム籍, 帰化]  # mails_talent 保存時に status=2 とするキーワード（件名/本文の部分一致）
+  status3_window_hours: 120  # status=3 重複判定の時間窓（時間）
+  matching_expire_hours: 120  # status=1 がマッチング対象外(status=4)になるまでの経過時間（時間）
   unclassified_log_path: logs/unclassified.log  # 未分類メールのログ出力先
   log_path: "logs/app.log"  # アプリケーションログの出力先
 
@@ -44,3 +51,4 @@ lmstudio:
   greeting_trim_chars: 100  # 本文先頭で挨拶として削る文字数
   interval_work_seconds: 180  # この秒数連続稼働したらインターバルを挿入（0で無効）
   interval_rest_seconds: 30   # インターバルの休止秒数
+  reload_interval_seconds: 900  # モデル再ロード間隔（秒）。初回は解析前に必ず再ロード
