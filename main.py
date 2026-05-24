@@ -392,6 +392,7 @@ def _run_matching_only(conn) -> dict[str, int]:
         matching_multiprocess_enabled = False
     matching_num_workers = max(1, int(matching_config.get('num_workers', 1)))
     matching_chunk_size = max(1, int(matching_config.get('chunk_size', 50)))
+    matching_talent_log_interval = max(1, int(matching_config.get('talent_log_interval', 100)))
 
     expired_talent, expired_project = expire_matching_target_records(
         conn,
@@ -409,6 +410,7 @@ def _run_matching_only(conn) -> dict[str, int]:
             use_multiprocessing=matching_multiprocess_enabled,
             num_workers=matching_num_workers,
             chunk_size=matching_chunk_size,
+            talent_log_interval=matching_talent_log_interval,
         )
         logger.info(
             f'マッチング処理完了: total={match_stats["total_matches"]}, '

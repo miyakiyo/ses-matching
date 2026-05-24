@@ -16,6 +16,7 @@ from .database_utils import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_MATCHING_CHUNK_SIZE = 50
+DEFAULT_TALENT_LOG_INTERVAL = 100
 
 
 def _normalize_list_value(field, split_plain_text: bool = True) -> list[str]:
@@ -619,6 +620,7 @@ def _compute_matches_sequential(
     conn: sqlite3.Connection,
     talent_ids: list[int],
     project_ids: list[int],
+    talent_log_interval: int,
 ) -> dict:
     """逐次でマッチング候補を計算します。"""
     project_records = _load_project_records(conn, project_ids)
@@ -626,6 +628,9 @@ def _compute_matches_sequential(
     total_matches = 0
     same_sender_skipped = 0
     zero_score_skipped = 0
+    processed_talent_count = 0
+
+    normalized_log_interval = max(1, int(talent_log_interval or DEFAULT_TALENT_LOG_INTERVAL))
 
     for talent_id in sorted(talent_ids):
         talent_record = get_talent_record(conn, talent_id)
@@ -637,11 +642,13 @@ def _compute_matches_sequential(
         total_matches += int(talent_stats["total_matches"])
         same_sender_skipped += int(talent_stats["same_sender_skipped"])
         zero_score_skipped += int(talent_stats["zero_score_skipped"])
-        logger.info(
-            "人材マッチング処理完了: talent_id=%s, subject=%s",
-            talent_id,
-            _get_talent_subject(talent_record),
-        )
+        processed_talent_count += 1
+        if processed_talent_count % normalized_log_interval == 0:
+            logger.info(
+                "人材マッチング処理完了: talent_id=%s, subject=%s",
+                talent_id,
+                _get_talent_subject(talent_record),
+            )
 
     return {
         "rows": pending_match_rows,
@@ -706,13 +713,19 @@ def _compute_matches_parallel(
     project_ids: list[int],
     num_workers: int,
     chunk_size: int,
+    talent_log_interval: int,
 ) -> dict:
     """マルチプロセスでマッチング候補を計算します。"""
     talent_chunks = _chunk_values(sorted(talent_ids), chunk_size)
     if len(talent_chunks) <= 1:
         conn = sqlite3.connect(db_path)
         try:
-            return _compute_matches_sequential(conn, talent_ids, project_ids)
+            return _compute_matches_sequential(
+                conn,
+                talent_ids,
+                project_ids,
+                talent_log_interval=talent_log_interval,
+            )
         finally:
             conn.close()
 
@@ -720,6 +733,8 @@ def _compute_matches_parallel(
     total_matches = 0
     same_sender_skipped = 0
     zero_score_skipped = 0
+    processed_talent_count = 0
+    normalized_log_interval = max(1, int(talent_log_interval or DEFAULT_TALENT_LOG_INTERVAL))
 
     with ProcessPoolExecutor(max_workers=max(1, int(num_workers or 1))) as executor:
         futures = [
@@ -733,11 +748,13 @@ def _compute_matches_parallel(
             same_sender_skipped += int(worker_stats["same_sender_skipped"])
             zero_score_skipped += int(worker_stats["zero_score_skipped"])
             for talent_id, subject in worker_stats["completed_talents"]:
-                logger.info(
-                    "人材マッチング処理完了: talent_id=%s, subject=%s",
-                    talent_id,
-                    subject,
-                )
+                processed_talent_count += 1
+                if processed_talent_count % normalized_log_interval == 0:
+                    logger.info(
+                        "人材マッチング処理完了: talent_id=%s, subject=%s",
+                        talent_id,
+                        subject,
+                    )
 
     return {
         "rows": pending_match_rows,
@@ -752,6 +769,7 @@ def process_all_matches(
     use_multiprocessing: bool = False,
     num_workers: int = 1,
     chunk_size: int = DEFAULT_MATCHING_CHUNK_SIZE,
+    talent_log_interval: int = DEFAULT_TALENT_LOG_INTERVAL,
     db_path: Optional[str] = None,
 ) -> dict:
     """全人材×全案件をスキャンして、マッチング処理を実行します。
@@ -781,9 +799,15 @@ def process_all_matches(
             project_ids=project_ids,
             num_workers=num_workers,
             chunk_size=chunk_size,
+            talent_log_interval=talent_log_interval,
         )
     else:
-        match_stats = _compute_matches_sequential(conn, talent_ids, project_ids)
+        match_stats = _compute_matches_sequential(
+            conn,
+            talent_ids,
+            project_ids,
+            talent_log_interval=talent_log_interval,
+        )
 
     matches_added = add_matches_bulk(conn, match_stats["rows"])
 

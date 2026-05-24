@@ -43,6 +43,7 @@ matching:
   multiprocess_enabled: false  # true の場合、案件評価ループをマルチプロセスで並列実行
   num_workers: 4               # 並列ワーカー数。1 の場合は逐次実行
   chunk_size: 50               # 1タスクあたりの人材件数
+  talent_log_interval: 100     # talent_id 完了ログの出力間隔（処理件数ベース）
 ```
 
 マッチングの並列化を有効にした場合も、`matches` テーブルへの更新は親プロセスが最後に一括で実行します。
