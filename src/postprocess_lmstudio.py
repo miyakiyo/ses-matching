@@ -224,6 +224,28 @@ def _apply_key_replacements_after_lm(
     return json_text, normalized_properties
 
 
+def _normalize_partial_match_keywords(keywords: list[str] | None) -> list[str]:
+    """部分一致判定に使うキーワード一覧を正規化します。"""
+    normalized: list[str] = []
+    for keyword in keywords or []:
+        value = str(keyword).strip()
+        if value:
+            normalized.append(value)
+    return normalized
+
+
+def _find_first_matched_keyword(subject: str, body: str, keywords: list[str]) -> str | None:
+    """subject/body への部分一致で、最初に一致したキーワードを返します。"""
+    if not keywords:
+        return None
+
+    target = f"{str(subject or '').strip()}\n{str(body or '').strip()}"
+    for keyword in keywords:
+        if keyword in target:
+            return keyword
+    return None
+
+
 def _sanitize_text_for_lm_request(text: str) -> str:
     """LM Studio 送信用に、JSONペイロード化で問題になり得る文字を除去する。"""
     normalized = text if isinstance(text, str) else str(text)
@@ -1596,6 +1618,7 @@ def process_pending_records_with_lmstudio(
     interval_work_seconds: int = 0,
     interval_rest_seconds: int = 30,
     reload_interval_seconds: int = 900,
+    status5_keywords: list[str] | None = None,
 ) -> tuple[int, int, int, int]:
     """status='0' のレコードを LM Studio でJSON化して保存します。"""
     total_success = 0
@@ -1616,6 +1639,7 @@ def process_pending_records_with_lmstudio(
         for folder_name in (exclude_folders_project or [])
         if str(folder_name).strip()
     ]
+    normalized_status5_keywords = _normalize_partial_match_keywords(status5_keywords)
 
     for table_name in ("mails_talent", "mails_project"):
         if table_name not in enabled_tables_set:
@@ -1649,8 +1673,8 @@ def process_pending_records_with_lmstudio(
         with ThreadPoolExecutor(max_workers=normalized_workers) as executor:
             for batch_start in range(0, len(record_list), normalized_workers):
                 batch = record_list[batch_start:batch_start + normalized_workers]
-                batch_futures: dict[Any, int] = {}
-                for record_id, body_text in batch:
+                batch_futures: dict[Any, tuple[int, str, str]] = {}
+                for record_id, subject_text, body_text in batch:
                     future = executor.submit(
                         _process_single_record_for_lm,
                         endpoint,
@@ -1663,12 +1687,12 @@ def process_pending_records_with_lmstudio(
                         greeting_trim_chars,
                         reload_interval_seconds,
                     )
-                    batch_futures[future] = record_id
+                    batch_futures[future] = (record_id, subject_text, body_text)
                     futures[future] = record_id
                     logger.debug(f"LM処理を投入: table={table_name}, id={record_id}")
 
                 for future in as_completed(batch_futures):
-                    record_id = batch_futures[future]
+                    record_id, subject_text, body_text = batch_futures[future]
                     processed_count += 1
                     try:
                         json_text, first_obj = future.result()
@@ -1686,13 +1710,29 @@ def process_pending_records_with_lmstudio(
                             len(json_text),
                             _truncate_for_log(json_text),
                         )
+                        save_status = "1"
+                        if table_name == "mails_project":
+                            matched_keyword = _find_first_matched_keyword(
+                                subject=subject_text,
+                                body=body_text,
+                                keywords=normalized_status5_keywords,
+                            )
+                            if matched_keyword:
+                                save_status = "5"
+                                logger.info(
+                                    "LM処理後に status=5 を付与: table=%s, id=%s, keyword=%s",
+                                    table_name,
+                                    record_id,
+                                    matched_keyword,
+                                )
+
                         update_record_json_status_and_properties(
                             conn=conn,
                             table_name=table_name,
                             record_id=record_id,
                             json_data=json_text,
                             properties=first_obj,
-                            status="1",
+                            status=save_status,
                         )
                         # 障害時の取りこぼしを避けるため、成功レコードごとに確定する。
                         conn.commit()

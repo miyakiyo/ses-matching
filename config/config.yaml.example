@@ -9,6 +9,8 @@ mailbox:
   shared_mailbox: sales@offgrid.co.jp  # 処理対象の共有メールボックスアドレス
   not_folder: []  # 除外フォルダリスト（例: [Documents, Archive]）
   not_folder_keywords: [迷惑メール, 送信トレイ, 送信済みアイテム, 削除済みアイテム, 三松システムコンサルティング, レンサ, ラグナロク, ユーフォノーツ, マイラップ, ブライトスター, ドリームビジョン, テックリーチ, クロニクル, グラントホープ, エンジニアのミカタ, エル・フィールド, イチアール]  # フォルダ名が完全一致したら除外（例: ["削除済みアイテム", "通知"]）
+  delete_not_folder: []  # メール削除時専用の除外フォルダリスト（未設定時は not_folder を使用）
+  delete_not_folder_keywords: [送信トレイ, 送信済みアイテム]  # メール削除時専用の除外キーワード（未設定時は not_folder_keywords を使用）
   lm_exclude_folders_talent: [三松システムコンサルティング, レンサ, ラグナロク, ユーフォノーツ, マイラップ, ブライトスター, ドリームビジョン, テックリーチ, クロニクル, グラントホープ, エンジニアのミカタ, エル・フィールド, イチアール]  # LM後処理(人材)の対象から除外するフォルダ名（完全一致）
   lm_exclude_folders_project: [三松システムコンサルティング, レンサ, ラグナロク, ユーフォノーツ, マイラップ, ブライトスター, ドリームビジョン, テックリーチ, クロニクル, グラントホープ, キャリアビート, エンジニアのミカタ, エル・フィールド, イチアール]  # LM後処理(案件)の対象から除外するフォルダ名（完全一致）
   db_path: DB/mails.db  # SQLite データベースファイルのパス
@@ -22,17 +24,17 @@ processes:
   delete_old: true  # 古いレコード削除を実行するか
   csv_export: true  # CSV出力を実行するか
 
-# マッチングログ設定
 matching:
-  incremental: true  # trueで前回マッチング実行以降の差分のみ再計算
-  log_interval_pairs: 1000  # 進捗ログを出す間隔（スキャン件数）
-  detailed_log_interval_pairs: 1000  # 詳細ログを出す間隔（有効マッチ件数）
+  multiprocess_enabled: false  # true の場合、案件評価ループをマルチプロセスで並列実行
+  num_workers: 4  # 並列ワーカー数。1 の場合は逐次実行
+  chunk_size: 50  # 1タスクあたりの人材件数
 
 # SES分類キーワード
 ses:
   project_keywords: [案件, 募集, 急募, 増員, 交代枠, エンド直, 元請直, 現場直, 参画予定, 参画中, 【ARI】, 元請け直, 商流不問, 開始]  # 案件判定に使うキーワード
   talent_keywords: [人材, 要員, プロパー,技術者, 要員, 弊社所属, 弊社社員, 稼働可能, 参画可能, 待機, 空き, フリーランス, 即戦力, 個人事業主, 正社員, 懇意BP, 歳, 直個人]  # 人材判定に使うキーワード
   status2_keywords: [一社下, 一社先, １社下, １社先, 1社下, 1社先, 懇意先, パートナー社員, コアパートナー, グループ会社社員, 中国籍, 韓国籍, ベトナム籍, 帰化]  # mails_talent 保存時に status=2 とするキーワード（件名/本文の部分一致）
+  status5_keywords: [貴社まで, 貴社所属まで, 派遣契約]  # mails_project の LM処理後、subject/body 部分一致で status=5（マッチング対象外）
   status3_window_hours: 120  # status=3 重複判定の時間窓（時間）
   matching_expire_hours: 120  # status=1 がマッチング対象外(status=4)になるまでの経過時間（時間）
   unclassified_log_path: logs/unclassified.log  # 未分類メールのログ出力先

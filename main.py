@@ -10,8 +10,6 @@ from src.database_utils import (
     init_db,
     get_last_run_at,
     record_run_at,
-    get_last_matching_run_at,
-    record_matching_run_at,
     expire_matching_target_records,
     delete_old_records,
     export_tables_to_csv,
@@ -321,6 +319,12 @@ def _run_lm_postprocess(conn, run_talent: bool = True, run_project: bool = True)
     lmstudio_interval_work_seconds = max(0, int(config.get('lmstudio', {}).get('interval_work_seconds', 0)))
     lmstudio_interval_rest_seconds = max(0, int(config.get('lmstudio', {}).get('interval_rest_seconds', 30)))
     lmstudio_reload_interval_seconds = max(0, int(config.get('lmstudio', {}).get('reload_interval_seconds', 900)))
+    status5_keywords_config = config.get('ses', {}).get('status5_keywords', [])
+    if isinstance(status5_keywords_config, list):
+        status5_keywords = [str(keyword).strip() for keyword in status5_keywords_config if str(keyword).strip()]
+    else:
+        logger.warning('config.ses.status5_keywords は list を指定してください。default=[] を使用します。')
+        status5_keywords = []
     lm_exclude_folders_talent = [str(name).strip() for name in LM_EXCLUDE_FOLDERS_TALENT if str(name).strip()]
     lm_exclude_folders_project = [str(name).strip() for name in LM_EXCLUDE_FOLDERS_PROJECT if str(name).strip()]
     enabled_tables = []
@@ -347,6 +351,7 @@ def _run_lm_postprocess(conn, run_talent: bool = True, run_project: bool = True)
         interval_work_seconds=lmstudio_interval_work_seconds,
         interval_rest_seconds=lmstudio_interval_rest_seconds,
         reload_interval_seconds=lmstudio_reload_interval_seconds,
+        status5_keywords=status5_keywords,
     )
     logger.info(f'LM後処理結果: success={lm_success}, error={lm_error}')
     return lm_success, lm_error, lm_success_talent, lm_success_project
@@ -380,14 +385,13 @@ def _run_matching_only(conn) -> dict[str, int]:
     from src.matching_engine import process_all_matches
     matching_config = config.get('matching', {})
     ses_config = config.get('ses', {})
-    matching_log_interval_pairs = int(matching_config.get('log_interval_pairs', 1000))
-    matching_detailed_log_interval_pairs = int(matching_config.get('detailed_log_interval_pairs', 1000))
     matching_expire_hours = max(0, int(ses_config.get('matching_expire_hours', 120)))
-    raw_incremental = matching_config.get('incremental', True)
-    matching_incremental = raw_incremental if isinstance(raw_incremental, bool) else True
-    if not isinstance(raw_incremental, bool):
-        logger.warning('config.matching.incremental は bool を指定してください。default=true を使用します。')
-    incremental_since = get_last_matching_run_at(conn) if matching_incremental else None
+    matching_multiprocess_enabled = matching_config.get('multiprocess_enabled', False)
+    if not isinstance(matching_multiprocess_enabled, bool):
+        logger.warning('config.matching.multiprocess_enabled は bool を指定してください。default=false を使用します。')
+        matching_multiprocess_enabled = False
+    matching_num_workers = max(1, int(matching_config.get('num_workers', 1)))
+    matching_chunk_size = max(1, int(matching_config.get('chunk_size', 50)))
 
     expired_talent, expired_project = expire_matching_target_records(
         conn,
@@ -402,22 +406,14 @@ def _run_matching_only(conn) -> dict[str, int]:
     try:
         match_stats = process_all_matches(
             conn,
-            log_interval_pairs=matching_log_interval_pairs,
-            detailed_log_interval_pairs=matching_detailed_log_interval_pairs,
-            incremental_mode=matching_incremental,
-            incremental_since=incremental_since,
+            use_multiprocessing=matching_multiprocess_enabled,
+            num_workers=matching_num_workers,
+            chunk_size=matching_chunk_size,
         )
-        record_matching_run_at(conn, datetime.now(timezone.utc))
-        timings = match_stats.get('timings', {})
         logger.info(
             f'マッチング処理完了: total={match_stats["total_matches"]}, '
-            f'added={match_stats["added"]}, updated={match_stats["updated"]}, '
-            f'incremental={matching_incremental}, '
-            f'expired_talent={expired_talent}, expired_project={expired_project}, '
-            f'total_elapsed={timings.get("total_elapsed_seconds", 0):.2f}s, '
-            f'score_calc={timings.get("score_calc_seconds", 0):.2f}s, '
-            f'add_match={timings.get("add_match_seconds", 0):.2f}s, '
-            f'add_commit={timings.get("add_match_commit_seconds", 0):.2f}s'
+            f'added={match_stats["added"]}, '
+            f'expired_talent={expired_talent}, expired_project={expired_project}'
         )
         return match_stats
     except Exception as e:
@@ -484,7 +480,7 @@ if __name__ == '__main__':
                 match_stats = _run_matching_only(conn)
                 _log_result_counts(
                     result_counts_logger,
-                    f'process=matching status=success matching_total={match_stats["total_matches"]} matching_added={match_stats["added"]} matching_updated={match_stats["updated"]}',
+                    f'process=matching status=success matching_total={match_stats["total_matches"]} matching_added={match_stats["added"]}',
                 )
             except Exception as e:
                 _log_result_counts(

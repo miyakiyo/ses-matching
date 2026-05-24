@@ -4,6 +4,7 @@
 
 実行: pipenv run python delete_mails_from_server.py
 オプション: pipenv run python delete_mails_from_server.py --days 7
+オプション: pipenv run python delete_mails_from_server.py --days 7 --hard-delete
 """
 import os
 import sys
@@ -47,6 +48,11 @@ def main():
         default=21,
         help='保持日数（デフォルト: 21日。これより前のメールを削除）'
     )
+    parser.add_argument(
+        '--hard-delete',
+        action='store_true',
+        help='完全削除を行う（削除済みアイテムに移動せず permanentDelete を使用）'
+    )
     args = parser.parse_args()
 
     try:
@@ -85,12 +91,17 @@ def main():
         access_token = acquire_access_token()
         logger.info('Graph API トークンを取得しました')
 
-        # 除外フォルダ設定を取得
-        not_folder = config.get('mailbox', {}).get('not_folder', [])
-        not_folder_keywords = config.get('mailbox', {}).get('not_folder_keywords', [])
+        # 削除時の除外フォルダ設定を取得（delete_* を優先、未設定時は既存キーへフォールバック）
+        mailbox_cfg = config.get('mailbox', {})
+        not_folder = mailbox_cfg.get('delete_not_folder', mailbox_cfg.get('not_folder', []))
+        not_folder_keywords = mailbox_cfg.get(
+            'delete_not_folder_keywords',
+            mailbox_cfg.get('not_folder_keywords', []),
+        )
 
         # メールサーバーからメール削除を実行
-        logger.info(f'{cutoff_dt.isoformat()} 以前のメールをメールサーバーから削除します')
+        delete_mode = 'hard-delete' if args.hard_delete else 'soft-delete'
+        logger.info(f'{cutoff_dt.isoformat()} 以前のメールをメールサーバーから削除します (mode={delete_mode})')
         deleted_count, error_count = delete_mails_before_date(
             mailbox,
             cutoff_dt,
@@ -98,6 +109,7 @@ def main():
             not_folder=not_folder,
             not_folder_keywords=not_folder_keywords,
             token_refresher=acquire_access_token,
+            hard_delete=args.hard_delete,
         )
 
         logger.info(f'メールサーバー削除完了: 削除={deleted_count}件, エラー={error_count}件')

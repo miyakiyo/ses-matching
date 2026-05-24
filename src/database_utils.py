@@ -1,7 +1,6 @@
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
-from time import perf_counter
 import csv
 import json
 import logging
@@ -316,52 +315,9 @@ def record_run_at(conn: sqlite3.Connection, run_at: datetime) -> None:
     conn.commit()
 
 
-def get_last_matching_run_at(conn: sqlite3.Connection) -> Optional[datetime]:
-    """前回のマッチング実行時刻を取得します。"""
-    row = conn.execute(
-        "SELECT run_at FROM matching_run_history ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    if not row or not row[0]:
-        return None
-    try:
-        return datetime.fromisoformat(str(row[0]).replace("Z", "+00:00"))
-    except Exception:
-        return None
-
-
-def record_matching_run_at(conn: sqlite3.Connection, run_at: datetime) -> None:
-    """マッチング実行時刻を履歴テーブルに保存します。"""
-    run_at_utc = run_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    conn.execute("INSERT INTO matching_run_history (run_at) VALUES (?)", (run_at_utc,))
-    conn.commit()
-
-
 def _to_sqlite_utc_timestamp(dt: datetime) -> str:
     """UTC datetime を SQLite CURRENT_TIMESTAMP 互換の文字列へ変換します。"""
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def get_changed_record_ids_since(
-    conn: sqlite3.Connection,
-    table_name: str,
-    since: datetime,
-) -> list[int]:
-    """基準時刻以降に更新された status='1' レコードIDを取得します。"""
-    if table_name not in ("mails_talent", "mails_project"):
-        raise ValueError("table_name must be either 'mails_talent' or 'mails_project'")
-
-    since_text = _to_sqlite_utc_timestamp(since)
-    rows = conn.execute(
-        f"""
-        SELECT id
-        FROM {table_name}
-        WHERE status = '1'
-          AND updated_at >= ?
-        ORDER BY id
-        """,
-        (since_text,),
-    ).fetchall()
-    return [row[0] for row in rows]
 
 
 def delete_matches_for_non_active_records(conn: sqlite3.Connection) -> int:
@@ -562,14 +518,14 @@ def get_pending_records(
     table_name: str,
     limit: int = 500,
     exclude_folders: list[str] | None = None,
-) -> list[tuple[int, str]]:
+) -> list[tuple[int, str, str]]:
     """未処理レコード（status='0'）を取得します。
 
     :param conn: SQLiteコネクション。
     :param table_name: 対象テーブル名（mails_talent または mails_project）。
     :param limit: 取得上限件数。
     :param exclude_folders: 除外するフォルダ名一覧（完全一致・大文字小文字無視）。
-    :return: (id, body) のタプル一覧。
+    :return: (id, subject, body) のタプル一覧。
     """
     if table_name not in ("mails_talent", "mails_project"):
         raise ValueError(f"Unsupported table_name: {table_name}")
@@ -594,7 +550,7 @@ def get_pending_records(
 
     rows = conn.execute(
         f"""
-        SELECT id, body
+        SELECT id, subject, body
         FROM {table_name}
         WHERE status = '0'
           AND body IS NOT NULL
@@ -604,7 +560,14 @@ def get_pending_records(
         """,
         tuple(params),
     ).fetchall()
-    return [(int(row[0]), str(row[1])) for row in rows]
+    return [
+        (
+            int(row[0]),
+            str(row[1] or ""),
+            str(row[2] or ""),
+        )
+        for row in rows
+    ]
 
 
 def update_record_json_status(
@@ -703,73 +666,46 @@ def update_record_json_status_and_properties(
     )
 
 
-def check_existing_match(conn: sqlite3.Connection, talent_id: int, project_id: int) -> bool:
-    """特定の人材-案件マッチングが既に存在するか確認します。
-
-    :param conn: SQLiteコネクション。
-    :param talent_id: 人材ID。
-    :param project_id: 案件ID。
-    :return: True（既存）、False（新規）。
-    """
-    result = conn.execute(
-        "SELECT id FROM matches WHERE talent_id = ? AND project_id = ? LIMIT 1",
-        (talent_id, project_id),
-    ).fetchone()
-    return result is not None
-
-
-def add_match(
+def add_matches_bulk(
     conn: sqlite3.Connection,
-    talent_id: int,
-    project_id: int,
-    score: int,
-    reason: dict,
-) -> tuple[int, dict[str, float]]:
-    """マッチング結果を matches テーブルに追加または更新します。
+    match_rows: list[tuple[int, int, int, dict]],
+) -> int:
+    """マッチング結果を matches テーブルへ一括で追加または更新します。
 
     :param conn: SQLiteコネクション。
-    :param talent_id: 人材ID。
-    :param project_id: 案件ID。
-    :param score: マッチングスコア（0-100）。
-    :param reason: マッチング理由（JSON辞書）。
-    :return: (挿入または更新されたレコードID, 処理時間内訳)。
+    :param match_rows: (talent_id, project_id, score, reason_dict) の配列。
+    :return: 追加または更新した件数。
     """
-    reason_json = json.dumps(reason, ensure_ascii=False)
-    timings = {
-        "execute_seconds": 0.0,
-        "commit_seconds": 0.0,
-        "fetch_id_seconds": 0.0,
-        "total_seconds": 0.0,
-    }
-    total_started = perf_counter()
-    
-    # UNIQUE 制約により、既存レコードは UPDATE、新規は INSERT される
-    execute_started = perf_counter()
-    conn.execute(
-        """
+    if not match_rows:
+        return 0
+
+    params: list[tuple[int, int, int, str]] = [
+        (
+            int(talent_id),
+            int(project_id),
+            int(score),
+            json.dumps(reason, ensure_ascii=False),
+        )
+        for talent_id, project_id, score, reason in match_rows
+    ]
+
+    sql = """
         INSERT INTO matches (talent_id, project_id, score, reason, status, created_at, updated_at)
         VALUES (?, ?, ?, ?, '0', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         ON CONFLICT(talent_id, project_id) DO UPDATE SET
             score = excluded.score,
             reason = excluded.reason,
             updated_at = CURRENT_TIMESTAMP
-        """,
-        (talent_id, project_id, score, reason_json),
-    )
-    timings["execute_seconds"] = perf_counter() - execute_started
+    """
 
-    commit_started = perf_counter()
-    conn.commit()
-    timings["commit_seconds"] = perf_counter() - commit_started
-    
-    fetch_started = perf_counter()
-    result = conn.execute(
-        "SELECT id FROM matches WHERE talent_id = ? AND project_id = ?",
-        (talent_id, project_id),
-    ).fetchone()
-    timings["fetch_id_seconds"] = perf_counter() - fetch_started
-    timings["total_seconds"] = perf_counter() - total_started
-    return (result[0] if result else -1, timings)
+    try:
+        conn.executemany(sql, params)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    return len(params)
 
 
 def get_all_matches(conn: sqlite3.Connection, limit: int = None) -> list[dict]:

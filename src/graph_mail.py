@@ -436,6 +436,7 @@ def delete_mails_before_date(
     not_folder: List[str] = None,
     not_folder_keywords: List[str] = None,
     token_refresher: Callable[[], str] = None,
+    hard_delete: bool = False,
 ) -> tuple:
     """指定日時より前のメールをメールボックスから削除します。
 
@@ -446,6 +447,7 @@ def delete_mails_before_date(
     :param not_folder: 除外フォルダ名一覧（完全一致）。
     :param not_folder_keywords: 除外キーワード一覧（完全一致）。
     :param token_refresher: 期限切れ時のアクセストークン再取得関数。
+    :param hard_delete: True の場合は permanentDelete を使って完全削除する。
     :return: (削除したメール数, エラー数) のタプル。
     """
     # access_tokenがない場合は処理を続行できないため、明示的に例外を投げる。
@@ -491,6 +493,13 @@ def delete_mails_before_date(
             resp = requests.delete(url, headers=headers)
         return resp
 
+    def _graph_post(url: str) -> requests.Response:
+        resp = requests.post(url, headers=headers)
+        if _is_expired_token_response(resp):
+            _refresh_access_token()
+            resp = requests.post(url, headers=headers)
+        return resp
+
     not_folder = not_folder or []
     not_folder_keywords = not_folder_keywords or []
 
@@ -534,13 +543,20 @@ def delete_mails_before_date(
                 msg_id = item.get("id")
                 msg_subject = item.get("subject", "(no subject)")
                 try:
-                    delete_url = f"https://graph.microsoft.com/v1.0/users/{user_email}/messages/{msg_id}"
-                    del_resp = _graph_delete(delete_url)
+                    if hard_delete:
+                        delete_url = f"https://graph.microsoft.com/v1.0/users/{user_email}/messages/{msg_id}/permanentDelete"
+                        del_resp = _graph_post(delete_url)
+                    else:
+                        delete_url = f"https://graph.microsoft.com/v1.0/users/{user_email}/messages/{msg_id}"
+                        del_resp = _graph_delete(delete_url)
                     if del_resp.status_code in [200, 204]:
                         deleted_count += 1
                         logger.debug(f"Deleted: {msg_subject}")
                     else:
-                        logger.warning(f"Failed to delete: {msg_subject} (status={del_resp.status_code})")
+                        logger.warning(
+                            f"Failed to delete: {msg_subject} "
+                            f"(status={del_resp.status_code}, detail={del_resp.text})"
+                        )
                         error_count += 1
                 except Exception as e:
                     logger.error(f"Error deleting message {msg_subject}: {e}")
