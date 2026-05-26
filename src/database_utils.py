@@ -10,6 +10,15 @@ import sqlite3
 logger = logging.getLogger(__name__)
 JST = timezone(timedelta(hours=9))
 
+# LMフォールバック時に json_data 内へ格納する内部メタキー。
+# これらはテーブル列へ展開しないため、列不一致警告の対象外とする。
+LM_JSON_METADATA_KEYS = {
+    "api_error",
+    "raw_content",
+    "sanitize_error",
+    "sanitized_content",
+}
+
 # CSV出力時にJST変換する日時カラム。
 CSV_DATETIME_COLUMNS = {
     "run_at",
@@ -221,16 +230,6 @@ def init_db(db_path: str = "DB/mails.db") -> sqlite3.Connection:
     )
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS matching_run_history (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_at     TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    conn.execute(
-        """
         CREATE TABLE IF NOT EXISTS mails_unclassified (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             folder      TEXT,
@@ -390,7 +389,7 @@ def delete_old_records(conn: sqlite3.Connection, days: int = 7) -> tuple:
 
     :param conn: SQLiteコネクション。
     :param days: 保持日数（デフォルト7日）。
-    :return: (削除した mails_talent 件数, 削除した mails_project 件数, 削除した run_history 件数) のタプル。
+    :return: (削除した mails_talent 件数, 削除した mails_project 件数, 削除した matches 件数, 削除した run_history 件数) のタプル。
     """
     # 指定日数前の日時をUTC ISO形式で計算する。
     cutoff_dt = datetime.now(timezone.utc) - timedelta(days=days)
@@ -425,13 +424,17 @@ def delete_old_records(conn: sqlite3.Connection, days: int = 7) -> tuple:
     )
     deleted_project = project_cursor.rowcount
 
+    # matches テーブルから古いレコードを削除する。
+    matches_cursor = conn.execute("DELETE FROM matches WHERE created_at < ?", (cutoff_str,))
+    deleted_matches = matches_cursor.rowcount
+
     # run_history テーブルから古いレコードを削除する。
     history_cursor = conn.execute("DELETE FROM run_history WHERE run_at < ?", (cutoff_str,))
     deleted_history = history_cursor.rowcount
     
     conn.commit()
 
-    return (deleted_talent, deleted_project, deleted_history)
+    return (deleted_talent, deleted_project, deleted_matches, deleted_history)
 
 
 def export_tables_to_csv(
@@ -632,6 +635,8 @@ def update_record_json_status_and_properties(
     for key, value in properties.items():
         col_name = str(key)
         if col_name not in allowed_cols:
+            if col_name in LM_JSON_METADATA_KEYS:
+                continue
             unknown_cols.append(col_name)
             continue
         prop_items.append((col_name, _to_text(value)))
@@ -679,15 +684,23 @@ def add_matches_bulk(
     if not match_rows:
         return 0
 
-    params: list[tuple[int, int, int, str]] = [
-        (
-            int(talent_id),
-            int(project_id),
-            int(score),
-            json.dumps(reason, ensure_ascii=False),
+    params: list[tuple[int, int, int, str]] = []
+    for talent_id, project_id, score, reason in match_rows:
+        normalized_score = int(score)
+        if normalized_score <= 0:
+            continue
+
+        params.append(
+            (
+                int(talent_id),
+                int(project_id),
+                normalized_score,
+                json.dumps(reason, ensure_ascii=False),
+            )
         )
-        for talent_id, project_id, score, reason in match_rows
-    ]
+
+    if not params:
+        return 0
 
     sql = """
         INSERT INTO matches (talent_id, project_id, score, reason, status, created_at, updated_at)

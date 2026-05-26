@@ -13,6 +13,9 @@ mailbox:
   delete_not_folder_keywords: [送信トレイ, 送信済みアイテム]  # メール削除時専用の除外キーワード（未設定時は not_folder_keywords を使用）
   lm_exclude_folders_talent: [三松システムコンサルティング, レンサ, ラグナロク, ユーフォノーツ, マイラップ, ブライトスター, ドリームビジョン, テックリーチ, クロニクル, グラントホープ, エンジニアのミカタ, エル・フィールド, イチアール]  # LM後処理(人材)の対象から除外するフォルダ名（完全一致）
   lm_exclude_folders_project: [三松システムコンサルティング, レンサ, ラグナロク, ユーフォノーツ, マイラップ, ブライトスター, ドリームビジョン, テックリーチ, クロニクル, グラントホープ, キャリアビート, エンジニアのミカタ, エル・フィールド, イチアール]  # LM後処理(案件)の対象から除外するフォルダ名（完全一致）
+  export_matches_joined_csv: true  # matches_joined.csv の出力可否
+  csv_copy_destinations: []  # CSV出力後のコピー先ディレクトリ（複数指定可）
+  db_copy_destinations: []  # CSV出力後のDBコピー先ディレクトリ（複数指定可）
   db_path: DB/mails.db  # SQLite データベースファイルのパス
 
 # 処理実行フラグ（CLI未指定時に適用、CLI指定時はCLIを優先）
@@ -23,6 +26,9 @@ processes:
   matching: true  # マッチング処理を実行するか
   delete_old: true  # 古いレコード削除を実行するか
   csv_export: true  # CSV出力を実行するか
+
+delete_old:
+  days: 7  # この日数より古いレコードを削除
 
 matching:
   multiprocess_enabled: false  # true の場合、案件評価ループをマルチプロセスで並列実行

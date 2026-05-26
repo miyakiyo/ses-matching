@@ -2,6 +2,7 @@ from msal import ConfidentialClientApplication
 from datetime import datetime, timezone, timedelta
 import argparse
 import os
+import shutil
 import yaml
 import logging
 from pathlib import Path
@@ -357,20 +358,40 @@ def _run_lm_postprocess(conn, run_talent: bool = True, run_project: bool = True)
     return lm_success, lm_error, lm_success_talent, lm_success_project
 
 
-def _run_delete_old_records(conn) -> tuple[int, int, int]:
+def _run_delete_old_records(conn) -> tuple[int, int, int, int]:
     """古いレコード削除を実行します。"""
-    deleted_talent, deleted_project, deleted_history = delete_old_records(conn, days=7)
-    logger.info(f'削除完了: mails_talent={deleted_talent}件, mails_project={deleted_project}件, run_history={deleted_history}件')
-    return deleted_talent, deleted_project, deleted_history
+    delete_days = max(1, int(config.get('delete_old', {}).get('days', 7)))
+    deleted_talent, deleted_project, deleted_matches, deleted_history = delete_old_records(conn, days=delete_days)
+    logger.info(
+        f'削除完了: days={delete_days}, '
+        f'mails_talent={deleted_talent}件, mails_project={deleted_project}件, '
+        f'matches={deleted_matches}件, run_history={deleted_history}件'
+    )
+    return deleted_talent, deleted_project, deleted_matches, deleted_history
 
 
 def _run_csv_export(conn) -> None:
     """CSV出力を実行します。"""
-    csv_output_dir = config.get('mailbox', {}).get('csv_output_dir', 'csv_exports')
-    include_matches_joined = config.get('mailbox', {}).get('export_matches_joined_csv', True)
+    mailbox_config = config.get('mailbox', {})
+    csv_output_dir = mailbox_config.get('csv_output_dir', 'csv_exports')
+    db_path = mailbox_config.get('db_path', 'DB/mails.db')
+    include_matches_joined = mailbox_config.get('export_matches_joined_csv', True)
     if not isinstance(include_matches_joined, bool):
         logger.warning('config.mailbox.export_matches_joined_csv は bool を指定してください。default=true を使用します。')
         include_matches_joined = True
+
+    raw_copy_destinations = mailbox_config.get('csv_copy_destinations', [])
+    if not isinstance(raw_copy_destinations, list):
+        logger.warning('config.mailbox.csv_copy_destinations は list を指定してください。default=[] を使用します。')
+        raw_copy_destinations = []
+    copy_destinations = [str(path).strip() for path in raw_copy_destinations if str(path).strip()]
+
+    raw_db_copy_destinations = mailbox_config.get('db_copy_destinations', [])
+    if not isinstance(raw_db_copy_destinations, list):
+        logger.warning('config.mailbox.db_copy_destinations は list を指定してください。default=[] を使用します。')
+        raw_db_copy_destinations = []
+    db_copy_destinations = [str(path).strip() for path in raw_db_copy_destinations if str(path).strip()]
+
     exported_files = export_tables_to_csv(
         conn,
         csv_output_dir,
@@ -378,6 +399,43 @@ def _run_csv_export(conn) -> None:
     )
     for exported_file in exported_files:
         logger.info(f'CSV出力完了: {exported_file}')
+
+    for destination in copy_destinations:
+        destination_path = Path(destination)
+        if not destination_path.is_dir():
+            logger.warning(f'CSVコピー先ディレクトリが存在しないためスキップします: {destination_path}')
+            continue
+
+        for exported_file in exported_files:
+            source_path = Path(exported_file)
+            if not source_path.exists():
+                logger.warning(f'コピー元CSVが存在しないためスキップします: {source_path}')
+                continue
+
+            target_path = destination_path / source_path.name
+            try:
+                shutil.copy2(source_path, target_path)
+                logger.info(f'CSVコピー完了: {source_path} -> {target_path}')
+            except Exception as ex:
+                logger.warning(f'CSVコピーに失敗しました: {source_path} -> {target_path}, error={ex}')
+
+    db_source_path = Path(db_path)
+    if not db_source_path.exists():
+        logger.warning(f'コピー元DBが存在しないためDBコピーをスキップします: {db_source_path}')
+        return
+
+    for destination in db_copy_destinations:
+        destination_path = Path(destination)
+        if not destination_path.is_dir():
+            logger.warning(f'DBコピー先ディレクトリが存在しないためスキップします: {destination_path}')
+            continue
+
+        target_path = destination_path / db_source_path.name
+        try:
+            shutil.copy2(db_source_path, target_path)
+            logger.info(f'DBコピー完了: {db_source_path} -> {target_path}')
+        except Exception as ex:
+            logger.warning(f'DBコピーに失敗しました: {db_source_path} -> {target_path}, error={ex}')
 
 
 def _run_matching_only(conn) -> dict[str, int]:
@@ -499,11 +557,11 @@ if __name__ == '__main__':
 
         if process_plan['delete_old']:
             try:
-                deleted_talent, deleted_project, deleted_history = _run_delete_old_records(conn)
-                delete_total = deleted_talent + deleted_project
+                deleted_talent, deleted_project, deleted_matches, deleted_history = _run_delete_old_records(conn)
+                delete_total = deleted_talent + deleted_project + deleted_matches
                 _log_result_counts(
                     result_counts_logger,
-                    f'process=delete status=success delete_total={delete_total} delete_talent={deleted_talent} delete_project={deleted_project} delete_history={deleted_history}',
+                    f'process=delete status=success delete_total={delete_total} delete_talent={deleted_talent} delete_project={deleted_project} delete_matches={deleted_matches} delete_history={deleted_history}',
                 )
             except Exception as e:
                 _log_result_counts(

@@ -34,7 +34,21 @@ processes:
   matching: true             # マッチング
   delete_old: true           # 古いレコード削除
   csv_export: true           # CSV出力
+
+delete_old:
+  days: 7                    # この日数より古いレコードを削除
+
+mailbox:
+  export_matches_joined_csv: true   # matches_joined.csv の出力可否
+  csv_copy_destinations: []         # CSV出力後のコピー先ディレクトリ（複数指定可）
+  db_copy_destinations: []          # CSV出力後のDBコピー先ディレクトリ（複数指定可）
 ```
+
+CSVコピー設定の補足:
+- `mailbox.csv_copy_destinations` に指定した複数ディレクトリへ、CSV出力後に同名ファイルを上書きコピーします。
+- `mailbox.db_copy_destinations` に指定した複数ディレクトリへ、CSV出力後にDBファイル（`mailbox.db_path`）を同名でコピーします。
+- コピー先ディレクトリが存在しない場合は自動作成せず、警告ログを出してそのコピー先をスキップします。
+- 一部ファイルのコピーが失敗しても、他ファイル・他コピー先の処理は継続します。
 
 ## マッチング設定
 
