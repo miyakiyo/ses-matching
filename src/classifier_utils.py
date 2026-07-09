@@ -93,3 +93,21 @@ def should_skip_folder(folder_name: str, not_folder: List[str], not_folder_keywo
             return True
 
     return False
+
+
+def should_exclude_by_sender_addr(sender_addr: str, exclude_patterns: List[str]) -> bool:
+    """メールアドレスが除外パターンに一致するか判定します。
+
+    :param sender_addr: 判定対象のメールアドレス。
+    :param exclude_patterns: 除外パターンリスト（部分一致、大文字小文字区別なし）。
+    :return: 除外対象なら True、それ以外は False。
+    """
+    if not sender_addr or not exclude_patterns:
+        return False
+
+    normalized_addr = str(sender_addr).lower()
+    for pattern in exclude_patterns:
+        if pattern and str(pattern).lower() in normalized_addr:
+            return True
+
+    return False

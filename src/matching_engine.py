@@ -10,6 +10,7 @@ from .database_utils import (
     get_project_record,
     add_matches_bulk,
     delete_matches_for_non_active_records,
+    delete_low_score_matches,
 )
 
 
@@ -587,12 +588,13 @@ def _collect_match_rows_for_talent(
     talent_id: int,
     talent_record: dict,
     project_records: list[tuple[int, dict]],
+    save_reason_in_db: bool,
 ) -> dict:
     """1人材に対する案件評価結果を集約します。"""
     total_matches = 0
     same_sender_skipped = 0
     zero_score_skipped = 0
-    pending_match_rows: list[tuple[int, int, int, dict]] = []
+    pending_match_rows: list[tuple[int, int, int, Optional[dict]]] = []
 
     for project_id, project_record in project_records:
         same_sender = _is_same_sender(talent_record, project_record)
@@ -605,6 +607,9 @@ def _collect_match_rows_for_talent(
         if score <= 0:
             zero_score_skipped += 1
             continue
+
+        if not save_reason_in_db:
+            reason = None
 
         pending_match_rows.append((talent_id, project_id, score, reason))
 
@@ -621,10 +626,11 @@ def _compute_matches_sequential(
     talent_ids: list[int],
     project_ids: list[int],
     talent_log_interval: int,
+    save_reason_in_db: bool,
 ) -> dict:
     """逐次でマッチング候補を計算します。"""
     project_records = _load_project_records(conn, project_ids)
-    pending_match_rows: list[tuple[int, int, int, dict]] = []
+    pending_match_rows: list[tuple[int, int, int, Optional[dict]]] = []
     total_matches = 0
     same_sender_skipped = 0
     zero_score_skipped = 0
@@ -637,7 +643,12 @@ def _compute_matches_sequential(
         if not talent_record:
             continue
 
-        talent_stats = _collect_match_rows_for_talent(talent_id, talent_record, project_records)
+        talent_stats = _collect_match_rows_for_talent(
+            talent_id,
+            talent_record,
+            project_records,
+            save_reason_in_db=save_reason_in_db,
+        )
         pending_match_rows.extend(talent_stats["rows"])
         total_matches += int(talent_stats["total_matches"])
         same_sender_skipped += int(talent_stats["same_sender_skipped"])
@@ -662,12 +673,13 @@ def _compute_matches_worker(
     db_path: str,
     talent_ids_chunk: list[int],
     project_ids: list[int],
+    save_reason_in_db: bool,
 ) -> dict:
     """子プロセスで人材チャンクのマッチング候補を計算します。"""
     conn = sqlite3.connect(db_path)
     try:
         project_records = _load_project_records(conn, project_ids)
-        pending_match_rows: list[tuple[int, int, int, dict]] = []
+        pending_match_rows: list[tuple[int, int, int, Optional[dict]]] = []
         total_matches = 0
         same_sender_skipped = 0
         zero_score_skipped = 0
@@ -678,7 +690,12 @@ def _compute_matches_worker(
             if not talent_record:
                 continue
 
-            talent_stats = _collect_match_rows_for_talent(talent_id, talent_record, project_records)
+            talent_stats = _collect_match_rows_for_talent(
+                talent_id,
+                talent_record,
+                project_records,
+                save_reason_in_db=save_reason_in_db,
+            )
             pending_match_rows.extend(talent_stats["rows"])
             total_matches += int(talent_stats["total_matches"])
             same_sender_skipped += int(talent_stats["same_sender_skipped"])
@@ -714,6 +731,7 @@ def _compute_matches_parallel(
     num_workers: int,
     chunk_size: int,
     talent_log_interval: int,
+    save_reason_in_db: bool,
 ) -> dict:
     """マルチプロセスでマッチング候補を計算します。"""
     talent_chunks = _chunk_values(sorted(talent_ids), chunk_size)
@@ -725,11 +743,12 @@ def _compute_matches_parallel(
                 talent_ids,
                 project_ids,
                 talent_log_interval=talent_log_interval,
+                save_reason_in_db=save_reason_in_db,
             )
         finally:
             conn.close()
 
-    pending_match_rows: list[tuple[int, int, int, dict]] = []
+    pending_match_rows: list[tuple[int, int, int, Optional[dict]]] = []
     total_matches = 0
     same_sender_skipped = 0
     zero_score_skipped = 0
@@ -738,7 +757,13 @@ def _compute_matches_parallel(
 
     with ProcessPoolExecutor(max_workers=max(1, int(num_workers or 1))) as executor:
         futures = [
-            executor.submit(_compute_matches_worker, db_path, talent_chunk, project_ids)
+            executor.submit(
+                _compute_matches_worker,
+                db_path,
+                talent_chunk,
+                project_ids,
+                save_reason_in_db,
+            )
             for talent_chunk in talent_chunks
         ]
         for future in as_completed(futures):
@@ -767,9 +792,11 @@ def _compute_matches_parallel(
 def process_all_matches(
     conn: sqlite3.Connection,
     use_multiprocessing: bool = False,
+    save_reason_in_db: bool = True,
     num_workers: int = 1,
     chunk_size: int = DEFAULT_MATCHING_CHUNK_SIZE,
     talent_log_interval: int = DEFAULT_TALENT_LOG_INTERVAL,
+    delete_low_score_threshold: int = 50,
     db_path: Optional[str] = None,
 ) -> dict:
     """全人材×全案件をスキャンして、マッチング処理を実行します。
@@ -777,7 +804,7 @@ def process_all_matches(
     処理完了した人材・案件レコード（status='1'）のみを対象とします。
 
     :param conn: SQLiteコネクション。
-    :return: 処理統計 {"total_matches": int, "added": int, "same_sender_skipped": int, "zero_score_skipped": int} の辞書。
+    :return: 処理統計 {"total_matches": int, "added": int, "low_score_deleted": int, "same_sender_skipped": int, "zero_score_skipped": int} の辞書。
     """
     # status='1'（LM処理済み）の人材・案件を取得
     talent_rows = conn.execute(
@@ -800,6 +827,7 @@ def process_all_matches(
             num_workers=num_workers,
             chunk_size=chunk_size,
             talent_log_interval=talent_log_interval,
+            save_reason_in_db=save_reason_in_db,
         )
     else:
         match_stats = _compute_matches_sequential(
@@ -807,15 +835,18 @@ def process_all_matches(
             talent_ids,
             project_ids,
             talent_log_interval=talent_log_interval,
+            save_reason_in_db=save_reason_in_db,
         )
 
     matches_added = add_matches_bulk(conn, match_stats["rows"])
+    low_score_deleted = delete_low_score_matches(conn, delete_low_score_threshold)
 
     # 一括保存では INSERT/UPDATE を区別せず、保存件数を added として返す。
     
     return {
         "total_matches": int(match_stats["total_matches"]),
         "added": matches_added,
+        "low_score_deleted": low_score_deleted,
         "same_sender_skipped": int(match_stats["same_sender_skipped"]),
         "zero_score_skipped": int(match_stats["zero_score_skipped"]),
     }

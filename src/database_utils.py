@@ -1,10 +1,23 @@
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from contextlib import contextmanager
 from typing import Optional
 import csv
 import json
 import logging
+import os
 import sqlite3
+import time
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 
 logger = logging.getLogger(__name__)
@@ -28,6 +41,125 @@ CSV_DATETIME_COLUMNS = {
     "talent_received_at",
     "project_received_at",
 }
+
+SQLITE_BUSY_TIMEOUT_MS = 300000
+DB_LOCK_POLL_INTERVAL_SECONDS = 1.0
+_TABLE_COLUMNS_CACHE: dict[int, dict[str, set[str]]] = {}
+
+
+def _lock_file_handle(lock_handle) -> None:
+    """ロックファイルの先頭1バイトを排他ロックします。"""
+    lock_handle.seek(0)
+    if lock_handle.tell() == 0 and lock_handle.read(1) == b"":
+        lock_handle.seek(0)
+        lock_handle.write(b"0")
+        lock_handle.flush()
+    lock_handle.seek(0)
+
+    if msvcrt is not None:
+        msvcrt.locking(lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
+        return
+    if fcntl is not None:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return
+    raise RuntimeError("Unsupported platform: no file locking backend available")
+
+
+def _unlock_file_handle(lock_handle) -> None:
+    """取得済みのロックファイルを解放します。"""
+    lock_handle.seek(0)
+    lock_handle.flush()  # Ensure all writes are flushed before unlocking
+    if msvcrt is not None:
+        msvcrt.locking(lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+    if fcntl is not None:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        return
+    raise RuntimeError("Unsupported platform: no file locking backend available")
+
+
+@contextmanager
+def advisory_db_lock(
+    db_path: str,
+    timeout_seconds: int = 900,
+    poll_interval_seconds: float = DB_LOCK_POLL_INTERVAL_SECONDS,
+):
+    """同一DBを使う別プロセス同士を待機させるための排他ロックです。"""
+    lock_path = Path(f"{db_path}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_handle = open(lock_path, "a+b")
+    start_time = time.monotonic()
+    last_wait_log_seconds = -1
+
+    # PHASE 2 FIX: Prepare message BEFORE acquiring lock
+    # This prevents truncate() from invalidating the lock byte range
+    message = f"pid={os.getpid()} acquired_at={datetime.now(timezone.utc).isoformat()}\n".encode("utf-8")
+
+    try:
+        while True:
+            try:
+                _lock_file_handle(lock_handle)
+                break
+            except OSError:
+                elapsed_seconds = int(time.monotonic() - start_time)
+                if elapsed_seconds >= timeout_seconds:
+                    raise TimeoutError(
+                        f"DB lock wait timed out after {timeout_seconds} seconds: {lock_path}"
+                    )
+                if elapsed_seconds != last_wait_log_seconds:
+                    logger.info(
+                        "DBロック待機中: db=%s, lock=%s, elapsed=%ss, timeout=%ss",
+                        db_path,
+                        lock_path,
+                        elapsed_seconds,
+                        timeout_seconds,
+                    )
+                    last_wait_log_seconds = elapsed_seconds
+                time.sleep(poll_interval_seconds)
+
+        # Write pre-prepared message while lock is held
+        lock_handle.seek(0)
+        lock_handle.truncate()
+        lock_handle.write(message)
+        lock_handle.flush()
+        yield
+    finally:
+        # PHASE 1 FIX: Defensive error handling for unlock failure
+        # If unlock fails, log warning but continue closing
+        try:
+            _unlock_file_handle(lock_handle)
+        except OSError as e:
+            logger.warning(
+                "ファイルロック解除に失敗しましたが、処理を継続します: lock_path=%s, error=%s",
+                lock_path,
+                e
+            )
+        finally:
+            lock_handle.close()
+
+
+def _configure_sqlite_connection(conn: sqlite3.Connection) -> None:
+    """SQLite の待機・ジャーナル設定を適用します。"""
+    conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+    journal_mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+    if journal_mode and str(journal_mode[0]).lower() != "wal":
+        logger.warning("SQLite journal_mode could not be set to WAL: actual=%s", journal_mode[0])
+    conn.execute("PRAGMA synchronous=NORMAL")
+
+
+def _get_table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    """接続ごとにテーブル列一覧をキャッシュして返します。"""
+    connection_cache = _TABLE_COLUMNS_CACHE.setdefault(id(conn), {})
+    cached_columns = connection_cache.get(table_name)
+    if cached_columns is not None:
+        return cached_columns
+
+    resolved_columns = {
+        row[1]
+        for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+    connection_cache[table_name] = resolved_columns
+    return resolved_columns
 
 
 def _to_jst_for_csv(value: object) -> object:
@@ -89,7 +221,9 @@ def init_db(db_path: str = "DB/mails.db") -> sqlite3.Connection:
     :param db_path: SQLiteデータベースファイルのパス。
     :return: 初期化済みのDBコネクション。
     """
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=max(30.0, SQLITE_BUSY_TIMEOUT_MS / 1000))
+    _TABLE_COLUMNS_CACHE[id(conn)] = {}
+    _configure_sqlite_connection(conn)
 
     # 既存DBの命名を project/talent へ移行する（旧名があり新名がない場合のみ）。
     existing_tables = {
@@ -281,6 +415,7 @@ def init_db(db_path: str = "DB/mails.db") -> sqlite3.Connection:
         ON matches(talent_id, project_id, updated_at)
         """
     )
+    conn.commit()
     return conn
 
 
@@ -331,6 +466,21 @@ def delete_matches_for_non_active_records(conn: sqlite3.Connection) -> int:
             SELECT id FROM mails_project WHERE status != '1'
         )
         """
+    )
+    deleted = cursor.rowcount if cursor.rowcount is not None else 0
+    conn.commit()
+    return deleted
+
+
+def delete_low_score_matches(conn: sqlite3.Connection, threshold: int) -> int:
+    """score が閾値以下の matches を削除します。"""
+    normalized_threshold = max(0, min(100, int(threshold)))
+    cursor = conn.execute(
+        """
+        DELETE FROM matches
+        WHERE score <= ?
+        """,
+        (normalized_threshold,),
     )
     deleted = cursor.rowcount if cursor.rowcount is not None else 0
     conn.commit()
@@ -433,6 +583,7 @@ def delete_old_records(conn: sqlite3.Connection, days: int = 7) -> tuple:
     deleted_history = history_cursor.rowcount
     
     conn.commit()
+    conn.execute("VACUUM")
 
     return (deleted_talent, deleted_project, deleted_matches, deleted_history)
 
@@ -616,10 +767,7 @@ def update_record_json_status_and_properties(
     if table_name not in ("mails_talent", "mails_project"):
         raise ValueError(f"Unsupported table_name: {table_name}")
 
-    allowed_cols = {
-        row[1]
-        for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-    }
+    allowed_cols = _get_table_columns(conn, table_name)
 
     def _to_text(value):
         if value is None:
@@ -673,29 +821,33 @@ def update_record_json_status_and_properties(
 
 def add_matches_bulk(
     conn: sqlite3.Connection,
-    match_rows: list[tuple[int, int, int, dict]],
+    match_rows: list[tuple[int, int, int, Optional[dict]]],
 ) -> int:
     """マッチング結果を matches テーブルへ一括で追加または更新します。
 
     :param conn: SQLiteコネクション。
-    :param match_rows: (talent_id, project_id, score, reason_dict) の配列。
+    :param match_rows: (talent_id, project_id, score, reason_dict_or_none) の配列。
     :return: 追加または更新した件数。
     """
     if not match_rows:
         return 0
 
-    params: list[tuple[int, int, int, str]] = []
+    params: list[tuple[int, int, int, Optional[str]]] = []
     for talent_id, project_id, score, reason in match_rows:
         normalized_score = int(score)
         if normalized_score <= 0:
             continue
+
+        serialized_reason = None
+        if reason is not None:
+            serialized_reason = json.dumps(reason, ensure_ascii=False)
 
         params.append(
             (
                 int(talent_id),
                 int(project_id),
                 normalized_score,
-                json.dumps(reason, ensure_ascii=False),
+                serialized_reason,
             )
         )
 

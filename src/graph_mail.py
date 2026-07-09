@@ -5,7 +5,7 @@ import json
 import sqlite3
 import requests
 
-from .classifier_utils import classify_ses_subject, should_mark_status2, should_skip_folder
+from .classifier_utils import classify_ses_subject, should_mark_status2, should_skip_folder, should_exclude_by_sender_addr
 
 
 logger = logging.getLogger(__name__)
@@ -99,6 +99,8 @@ def get_mail_subjects(
     not_folder: List[str] = None,
     not_folder_keywords: List[str] = None,
     status3_window_hours: int = 48,
+    exclude_sender_patterns_talent: List[str] = None,
+    exclude_sender_patterns_project: List[str] = None,
     token_refresher: Callable[[], str] = None,
 ) -> tuple[List[Tuple[str, str]], dict[str, int]]:
     """指定期間のメール件名を取得し、分類に応じてDB保存します。
@@ -115,6 +117,8 @@ def get_mail_subjects(
     :param not_folder: 除外フォルダ名一覧（完全一致）。
     :param not_folder_keywords: 除外キーワード一覧（完全一致）。
     :param status3_window_hours: status=3 判定に使う重複検知ウィンドウ時間。
+    :param exclude_sender_patterns_talent: 人材テーブル保存時に除外するメールアドレスパターン一覧。
+    :param exclude_sender_patterns_project: 案件テーブル保存時に除外するメールアドレスパターン一覧。
     :return: ((folder_name, subject) の一覧, 分類別件数辞書)。
     """
 
@@ -307,6 +311,15 @@ def get_mail_subjects(
                             category_counts["project"] += 1
                         else:  # 未分類
                             table_name = "mails_unclassified"
+
+                        # メールアドレスフィルター処理：除外パターンに一致する場合はスキップ
+                        if table_name == "mails_talent" and should_exclude_by_sender_addr(sender_addr, exclude_sender_patterns_talent):
+                            logger.debug(f"メール除外（人材）: {sender_addr} - {subj}")
+                            continue
+
+                        if table_name == "mails_project" and should_exclude_by_sender_addr(sender_addr, exclude_sender_patterns_project):
+                            logger.debug(f"メール除外（案件）: {sender_addr} - {subj}")
+                            continue
 
                         # 全分類（人材、案件、未分類）をテーブルに保存する。
                         json_payload = json.dumps(item, ensure_ascii=False)
