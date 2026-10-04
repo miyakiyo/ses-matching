@@ -2,6 +2,7 @@ import csv
 import json
 import logging
 import re
+import subprocess
 import threading
 import time
 import unicodedata
@@ -1312,11 +1313,100 @@ def _reload_lmstudio_model(endpoint: str, model: str, timeout: int) -> None:
     load_resp.raise_for_status()
 
 
+def _wait_for_lmstudio_api_ready(endpoint: str, timeout: int, startup_wait_seconds: int) -> bool:
+    """LM Studio API が応答可能になるまで待機する。"""
+    base_url = _resolve_lmstudio_base_url(endpoint)
+    list_url = f"{base_url}/api/v1/models"
+    wait_limit = max(1, int(startup_wait_seconds))
+    deadline = time.monotonic() + wait_limit
+
+    while True:
+        try:
+            response = requests.get(list_url, timeout=max(1, int(timeout)))
+            if response.ok:
+                return True
+        except requests.RequestException:
+            pass
+
+        if time.monotonic() >= deadline:
+            return False
+
+        time.sleep(1)
+
+
+def _restart_lmstudio_process(
+    endpoint: str,
+    timeout: int,
+    process_name: str,
+    process_start_command: str,
+    process_startup_wait_seconds: int,
+) -> bool:
+    """LM Studio プロセスを再起動し、API疎通まで待機する。"""
+    normalized_name = str(process_name).strip()
+    normalized_command = str(process_start_command).strip()
+    startup_wait = max(1, int(process_startup_wait_seconds))
+
+    if not normalized_name:
+        logger.warning("LM Studio process restart skipped: process_name is empty")
+        return False
+    if not normalized_command:
+        logger.warning("LM Studio process restart skipped: process_start_command is empty")
+        return False
+
+    stop_result = subprocess.run(
+        ["taskkill", "/IM", normalized_name, "/F"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if stop_result.returncode == 0:
+        logger.info("LM Studio process stop complete: process=%s", normalized_name)
+    else:
+        logger.warning(
+            "LM Studio process stop warning: process=%s, returncode=%s, stdout=%s, stderr=%s",
+            normalized_name,
+            stop_result.returncode,
+            _truncate_for_log(stop_result.stdout or ""),
+            _truncate_for_log(stop_result.stderr or ""),
+        )
+
+    start_result = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", normalized_command],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if start_result.returncode != 0:
+        logger.warning(
+            "LM Studio process start failed: returncode=%s, stdout=%s, stderr=%s",
+            start_result.returncode,
+            _truncate_for_log(start_result.stdout or ""),
+            _truncate_for_log(start_result.stderr or ""),
+        )
+        return False
+
+    logger.info("LM Studio process start complete; waiting API ready: wait_seconds=%s", startup_wait)
+    if not _wait_for_lmstudio_api_ready(
+        endpoint=endpoint,
+        timeout=timeout,
+        startup_wait_seconds=startup_wait,
+    ):
+        logger.warning("LM Studio API ready wait timeout: wait_seconds=%s", startup_wait)
+        return False
+
+    logger.info("LM Studio process restart complete")
+    return True
+
+
 def _ensure_lmstudio_model_reloaded(
     endpoint: str,
     model: str,
     timeout: int,
     reload_interval_seconds: int,
+    process_restart_enabled: bool = False,
+    process_name: str = "LM Studio.exe",
+    process_start_command: str = "",
+    process_startup_wait_seconds: int = 30,
 ) -> None:
     """必要なタイミングでLM Studioモデルを再ロードする。"""
     global _LMSTUDIO_LAST_RELOAD_MONOTONIC
@@ -1332,14 +1422,33 @@ def _ensure_lmstudio_model_reloaded(
         if not should_reload:
             return
 
-        logger.info(
-            "LM Studio model reload start: model=%s, interval_seconds=%s",
-            model,
-            normalized_interval,
-        )
-        _reload_lmstudio_model(endpoint=endpoint, model=model, timeout=timeout)
+        if process_restart_enabled:
+            logger.info(
+                "LM Studio process restart start: process=%s, interval_seconds=%s",
+                process_name,
+                normalized_interval,
+            )
+            restart_ok = _restart_lmstudio_process(
+                endpoint=endpoint,
+                timeout=timeout,
+                process_name=process_name,
+                process_start_command=process_start_command,
+                process_startup_wait_seconds=process_startup_wait_seconds,
+            )
+            if restart_ok:
+                logger.info("LM Studio process restart complete: process=%s", process_name)
+            else:
+                logger.warning("LM Studio process restart skipped/failed; continue processing")
+        else:
+            logger.info(
+                "LM Studio model reload start: model=%s, interval_seconds=%s",
+                model,
+                normalized_interval,
+            )
+            _reload_lmstudio_model(endpoint=endpoint, model=model, timeout=timeout)
+            logger.info("LM Studio model reload complete: model=%s", model)
+
         _LMSTUDIO_LAST_RELOAD_MONOTONIC = time.monotonic()
-        logger.info("LM Studio model reload complete: model=%s", model)
 
 
 def _call_lmstudio(
@@ -1400,9 +1509,9 @@ def _call_lmstudio(
 
     request_variants.append((system_content, prompt))
 
-    shortened_prompt = prompt[:12000]
+    shortened_prompt = prompt[:4000]
     if shortened_prompt != prompt:
-        # 長文ケース向けの短縮版
+        # 長文ケース向けの短縮版（num_ctx=8192 を超えないよう上限を抑制）
         request_variants.append((system_content, shortened_prompt))
 
     resp: requests.Response | None = None
@@ -1543,14 +1652,24 @@ def _process_single_record_for_lm(
     signature_trim_chars: int = 300,
     greeting_trim_chars: int = 100,
     reload_interval_seconds: int = 900,
+    process_restart_enabled: bool = False,
+    process_name: str = "LM Studio.exe",
+    process_start_command: str = "",
+    process_startup_wait_seconds: int = 30,
+    provider: str = "lmstudio",
 ) -> tuple[str, dict[str, Any]]:
     """単一レコードのLM問い合わせ結果を返す（DB更新は行わない）。"""
-    _ensure_lmstudio_model_reloaded(
-        endpoint=endpoint,
-        model=model,
-        timeout=timeout,
-        reload_interval_seconds=reload_interval_seconds,
-    )
+    if provider == "lmstudio":
+        _ensure_lmstudio_model_reloaded(
+            endpoint=endpoint,
+            model=model,
+            timeout=timeout,
+            reload_interval_seconds=reload_interval_seconds,
+            process_restart_enabled=process_restart_enabled,
+            process_name=process_name,
+            process_start_command=process_start_command,
+            process_startup_wait_seconds=process_startup_wait_seconds,
+        )
 
     attempt_max_tokens = max(1, int(max_tokens))
     last_error: Exception | None = None
@@ -1618,9 +1737,14 @@ def process_pending_records_with_lmstudio(
     interval_work_seconds: int = 0,
     interval_rest_seconds: int = 30,
     reload_interval_seconds: int = 900,
+    process_restart_enabled: bool = False,
+    process_name: str = "LM Studio.exe",
+    process_start_command: str = "",
+    process_startup_wait_seconds: int = 30,
     status5_keywords: list[str] | None = None,
+    provider: str = "lmstudio",
 ) -> tuple[int, int, int, int]:
-    """status='0' のレコードを LM Studio でJSON化して保存します。"""
+    """status='0' のレコードを LM でJSON化して保存します。"""
     total_success = 0
     total_error = 0
     success_talent = 0
@@ -1641,7 +1765,7 @@ def process_pending_records_with_lmstudio(
     ]
     normalized_status5_keywords = _normalize_partial_match_keywords(status5_keywords)
 
-    for table_name in ("mails_talent", "mails_project"):
+    for table_name in ("mails_project", "mails_talent"):
         if table_name not in enabled_tables_set:
             logger.info(f"LM後処理スキップ: table={table_name}")
             continue
@@ -1677,15 +1801,20 @@ def process_pending_records_with_lmstudio(
                 for record_id, subject_text, body_text in batch:
                     future = executor.submit(
                         _process_single_record_for_lm,
-                        endpoint,
-                        model,
-                        body_text,
-                        category,
-                        timeout,
-                        max_tokens,
-                        signature_trim_chars,
-                        greeting_trim_chars,
-                        reload_interval_seconds,
+                        endpoint=endpoint,
+                        model=model,
+                        body_text=body_text,
+                        category=category,
+                        timeout=timeout,
+                        max_tokens=max_tokens,
+                        signature_trim_chars=signature_trim_chars,
+                        greeting_trim_chars=greeting_trim_chars,
+                        reload_interval_seconds=reload_interval_seconds,
+                        process_restart_enabled=process_restart_enabled,
+                        process_name=process_name,
+                        process_start_command=process_start_command,
+                        process_startup_wait_seconds=process_startup_wait_seconds,
+                        provider=provider,
                     )
                     batch_futures[future] = (record_id, subject_text, body_text)
                     futures[future] = record_id
@@ -1767,7 +1896,7 @@ def process_pending_records_with_lmstudio(
             match_stats = process_all_matches(conn)
             logger.info(
                 f"マッチング処理完了: total={match_stats['total_matches']}, "
-                f"added={match_stats['added']}, updated={match_stats['updated']}"
+                f"added={match_stats['added']}, low_score_deleted={match_stats['low_score_deleted']}"
             )
         except Exception as e:
             logger.error(f"マッチング処理失敗: {e}")

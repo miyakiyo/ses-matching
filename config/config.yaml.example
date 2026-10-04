@@ -11,8 +11,10 @@ mailbox:
   not_folder_keywords: [迷惑メール, 送信トレイ, 送信済みアイテム, 削除済みアイテム, 三松システムコンサルティング, レンサ, ラグナロク, ユーフォノーツ, マイラップ, ブライトスター, ドリームビジョン, テックリーチ, クロニクル, グラントホープ, エンジニアのミカタ, エル・フィールド, イチアール]  # フォルダ名が完全一致したら除外（例: ["削除済みアイテム", "通知"]）
   delete_not_folder: []  # メール削除時専用の除外フォルダリスト（未設定時は not_folder を使用）
   delete_not_folder_keywords: [送信トレイ, 送信済みアイテム]  # メール削除時専用の除外キーワード（未設定時は not_folder_keywords を使用）
-  lm_exclude_folders_talent: [三松システムコンサルティング, レンサ, ラグナロク, ユーフォノーツ, マイラップ, ブライトスター, ドリームビジョン, テックリーチ, クロニクル, グラントホープ, エンジニアのミカタ, エル・フィールド, イチアール]  # LM後処理(人材)の対象から除外するフォルダ名（完全一致）
-  lm_exclude_folders_project: [三松システムコンサルティング, レンサ, ラグナロク, ユーフォノーツ, マイラップ, ブライトスター, ドリームビジョン, テックリーチ, クロニクル, グラントホープ, キャリアビート, エンジニアのミカタ, エル・フィールド, イチアール]  # LM後処理(案件)の対象から除外するフォルダ名（完全一致）
+  lm_exclude_folders_talent: [三松システムコンサルティング, レンサ, ラグナロク, ユーフォノーツ, マイラップ, ブライトスター, ドリームビジョン, テックリーチ, クロニクル, グラントホープ, キャリアビート, エンジニアのミカタ, エル・フィールド, イチアール]  # LM後処理(人材)の対象から除外するフォルダ名（完全一致）
+  lm_exclude_folders_project: [三松システムコンサルティング, レンサ, ラグナロク, ユーフォノーツ, マイラップ, ブライトスター, ドリームビジョン, テックリーチ, クロニクル, グラントホープ, エンジニアのミカタ, エル・フィールド, イチアール]  # LM後処理(案件)の対象から除外するフォルダ名（完全一致）
+  exclude_sender_patterns_talent: []  # 人材テーブル保存時に除外するメールアドレスパターン（部分一致、大文字小文字区別なし）
+  exclude_sender_patterns_project: []  # 案件テーブル保存時に除外するメールアドレスパターン（部分一致、大文字小文字区別なし）
   export_matches_joined_csv: true  # matches_joined.csv の出力可否
   csv_copy_destinations: []  # CSV出力後のコピー先ディレクトリ（複数指定可）
   db_copy_destinations: []  # CSV出力後のDBコピー先ディレクトリ（複数指定可）
@@ -32,9 +34,11 @@ delete_old:
 
 matching:
   multiprocess_enabled: false  # true の場合、案件評価ループをマルチプロセスで並列実行
+  save_reason_in_db: true  # false の場合、matches.reason は保存せず NULL を保存
   num_workers: 4  # 並列ワーカー数。1 の場合は逐次実行
   chunk_size: 50  # 1タスクあたりの人材件数
   talent_log_interval: 100  # talent_id 完了ログの出力間隔（処理件数ベース）
+  delete_low_score_threshold: 50  # マッチング後に score がこの値以下の matches を削除
 
 # SES分類キーワード
 ses:
@@ -46,6 +50,10 @@ ses:
   matching_expire_hours: 120  # status=1 がマッチング対象外(status=4)になるまでの経過時間（時間）
   unclassified_log_path: logs/unclassified.log  # 未分類メールのログ出力先
   log_path: "logs/app.log"  # アプリケーションログの出力先
+
+# LLM プロバイダー選択
+llm:
+  provider: lmstudio  # 使用するプロバイダー: lmstudio / vllm / ollama
 
 # LM Studio 設定
 lmstudio:
@@ -60,4 +68,36 @@ lmstudio:
   greeting_trim_chars: 100  # 本文先頭で挨拶として削る文字数
   interval_work_seconds: 180  # この秒数連続稼働したらインターバルを挿入（0で無効）
   interval_rest_seconds: 30   # インターバルの休止秒数
-  reload_interval_seconds: 900  # モデル再ロード間隔（秒）。初回は解析前に必ず再ロード
+  reload_interval_seconds: 900  # モデル再ロード/再起動間隔（秒）。初回は解析前に必ず実行
+  process_restart_enabled: false  # true の場合はモデル再ロードの代わりにLM Studioプロセスを再起動
+  process_name: LM Studio.exe  # taskkill対象プロセス名
+  process_start_command: ""  # プロセス起動コマンド（PowerShellで実行）
+  process_startup_wait_seconds: 30  # 起動後にAPI応答を待つ最大秒数
+
+# vLLM 設定（llm.provider: vllm のときに使用）
+vllm:
+  endpoint: http://localhost:8000/v1/chat/completions  # vLLM API エンドポイント
+  model: your-model-name  # vLLM でサーブしているモデル名
+  timeout: 180  # リクエストタイムアウト秒数
+  max_tokens: 4096  # 生成トークン上限
+  limit_per_table_talent: 500  # 人材テーブルの1回あたり処理件数上限
+  limit_per_table_project: 500  # 案件テーブルの1回あたり処理件数上限
+  num_workers: 1  # 並列実行ワーカー数
+  signature_trim_chars: 300  # 本文末尾で署名として削る文字数
+  greeting_trim_chars: 100  # 本文先頭で挨拶として削る文字数
+  interval_work_seconds: 0  # この秒数連続稼働したらインターバルを挿入（0で無効）
+  interval_rest_seconds: 5   # インターバルの休止秒数
+
+# Ollama 設定（llm.provider: ollama のときに使用）
+ollama:
+  endpoint: http://localhost:11434/v1/chat/completions  # Ollama API エンドポイント
+  model: your-model-name  # Ollama でサーブしているモデル名（例: llama3, gemma3）
+  timeout: 180  # リクエストタイムアウト秒数
+  max_tokens: 4096  # 生成トークン上限
+  limit_per_table_talent: 500  # 人材テーブルの1回あたり処理件数上限
+  limit_per_table_project: 500  # 案件テーブルの1回あたり処理件数上限
+  num_workers: 1  # 並列実行ワーカー数
+  signature_trim_chars: 300  # 本文末尾で署名として削る文字数
+  greeting_trim_chars: 100  # 本文先頭で挨拶として削る文字数
+  interval_work_seconds: 0  # この秒数連続稼働したらインターバルを挿入（0で無効）
+  interval_rest_seconds: 5   # インターバルの休止秒数

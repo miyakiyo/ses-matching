@@ -3,11 +3,13 @@ from datetime import datetime, timezone, timedelta
 import argparse
 import os
 import shutil
+import sqlite3
 import yaml
 import logging
 from pathlib import Path
 
 from src.database_utils import (
+    advisory_db_lock,
     init_db,
     get_last_run_at,
     record_run_at,
@@ -71,6 +73,8 @@ NOT_FOLDER = config.get('mailbox', {}).get('not_folder', [])
 NOT_FOLDER_KEYWORDS = config.get('mailbox', {}).get('not_folder_keywords', [])
 LM_EXCLUDE_FOLDERS_TALENT = config.get('mailbox', {}).get('lm_exclude_folders_talent', [])
 LM_EXCLUDE_FOLDERS_PROJECT = config.get('mailbox', {}).get('lm_exclude_folders_project', [])
+EXCLUDE_SENDER_PATTERNS_TALENT = config.get('mailbox', {}).get('exclude_sender_patterns_talent', [])
+EXCLUDE_SENDER_PATTERNS_PROJECT = config.get('mailbox', {}).get('exclude_sender_patterns_project', [])
 
 PROCESS_DEFAULTS = {
     'mail_fetch': True,
@@ -102,6 +106,17 @@ def _resolve_process_config() -> dict[str, bool]:
         raw_value = raw_processes.get(process_name) if isinstance(raw_processes, dict) else None
         resolved[process_name] = _coerce_process_flag(process_name, raw_value, default)
     return resolved
+
+
+def _resolve_db_lock_timeout_seconds() -> int:
+    """同一DBを使う別プロセス待機時間を設定から解決します。"""
+    mailbox_config = config.get('mailbox', {})
+    raw_timeout = mailbox_config.get('db_lock_timeout_seconds', 900)
+    try:
+        return max(1, int(raw_timeout))
+    except (TypeError, ValueError):
+        logger.warning('config.mailbox.db_lock_timeout_seconds は1以上の整数を指定してください。default=900 を使用します。')
+        return 900
 
 def _parse_args() -> argparse.Namespace:
     """起動引数を解析します。"""
@@ -282,6 +297,8 @@ def _run_mail_fetch(conn, access_token: str) -> tuple[datetime, int, int, int, i
         status3_window_hours=status3_window_hours,
         not_folder=NOT_FOLDER,
         not_folder_keywords=NOT_FOLDER_KEYWORDS,
+        exclude_sender_patterns_talent=EXCLUDE_SENDER_PATTERNS_TALENT,
+        exclude_sender_patterns_project=EXCLUDE_SENDER_PATTERNS_PROJECT,
         token_refresher=_acquire_access_token,
     )
 
@@ -308,18 +325,42 @@ def _run_lm_postprocess(conn, run_talent: bool = True, run_project: bool = True)
         logger.info('LM後処理は設定によりスキップされました。')
         return 0, 0, 0, 0
 
-    lmstudio_endpoint = config.get('lmstudio', {}).get('endpoint', 'http://localhost:1234/v1/chat/completions')
-    lmstudio_model = config.get('lmstudio', {}).get('model', 'Qwen2.5-7B-Instruct-GGUF')
-    lmstudio_timeout = int(config.get('lmstudio', {}).get('timeout', 60))
-    lmstudio_max_tokens = max(1, int(config.get('lmstudio', {}).get('max_tokens', 512)))
-    lmstudio_limit_talent = int(config.get('lmstudio', {}).get('limit_per_table_talent', 500))
-    lmstudio_limit_project = int(config.get('lmstudio', {}).get('limit_per_table_project', 500))
-    lmstudio_num_workers = max(1, int(config.get('lmstudio', {}).get('num_workers', 4)))
-    lmstudio_signature_trim_chars = max(0, int(config.get('lmstudio', {}).get('signature_trim_chars', 300)))
-    lmstudio_greeting_trim_chars = max(0, int(config.get('lmstudio', {}).get('greeting_trim_chars', 100)))
-    lmstudio_interval_work_seconds = max(0, int(config.get('lmstudio', {}).get('interval_work_seconds', 0)))
-    lmstudio_interval_rest_seconds = max(0, int(config.get('lmstudio', {}).get('interval_rest_seconds', 30)))
-    lmstudio_reload_interval_seconds = max(0, int(config.get('lmstudio', {}).get('reload_interval_seconds', 900)))
+    _VALID_PROVIDERS = ('lmstudio', 'vllm', 'ollama')
+    llm_provider = str(config.get('llm', {}).get('provider', 'lmstudio')).strip().lower()
+    if llm_provider not in _VALID_PROVIDERS:
+        logger.error(
+            'config.llm.provider に無効な値が指定されました: "%s"。'
+            '有効な値: %s。lmstudio にフォールバックします。',
+            llm_provider, ', '.join(_VALID_PROVIDERS),
+        )
+        llm_provider = 'lmstudio'
+
+    llm_cfg = config.get(llm_provider, {})
+    if not llm_cfg:
+        logger.error(
+            'config.%s セクションが見つかりません。設定を確認してください。',
+            llm_provider,
+        )
+
+    lmstudio_endpoint = str(llm_cfg.get('endpoint', 'http://localhost:1234/v1/chat/completions'))
+    lmstudio_model = str(llm_cfg.get('model', 'Qwen2.5-7B-Instruct-GGUF'))
+    lmstudio_timeout = int(llm_cfg.get('timeout', 60))
+    lmstudio_max_tokens = max(1, int(llm_cfg.get('max_tokens', 512)))
+    lmstudio_limit_talent = int(llm_cfg.get('limit_per_table_talent', 500))
+    lmstudio_limit_project = int(llm_cfg.get('limit_per_table_project', 500))
+    lmstudio_num_workers = max(1, int(llm_cfg.get('num_workers', 4)))
+    lmstudio_signature_trim_chars = max(0, int(llm_cfg.get('signature_trim_chars', 300)))
+    lmstudio_greeting_trim_chars = max(0, int(llm_cfg.get('greeting_trim_chars', 100)))
+    lmstudio_interval_work_seconds = max(0, int(llm_cfg.get('interval_work_seconds', 0)))
+    lmstudio_interval_rest_seconds = max(0, int(llm_cfg.get('interval_rest_seconds', 30)))
+    # LM Studio 固有設定（vllm では使用しないが値として読み込む）
+    lmstudio_cfg = config.get('lmstudio', {})
+    lmstudio_reload_interval_seconds = max(0, int(lmstudio_cfg.get('reload_interval_seconds', 900)))
+    lmstudio_process_restart_enabled = bool(lmstudio_cfg.get('process_restart_enabled', False))
+    lmstudio_process_name = str(lmstudio_cfg.get('process_name', 'LM Studio.exe')).strip() or 'LM Studio.exe'
+    lmstudio_process_start_command = str(lmstudio_cfg.get('process_start_command', '')).strip()
+    lmstudio_process_startup_wait_seconds = max(1, int(lmstudio_cfg.get('process_startup_wait_seconds', 30)))
+    logger.info('LLMプロバイダー: %s, endpoint: %s, model: %s', llm_provider, lmstudio_endpoint, lmstudio_model)
     status5_keywords_config = config.get('ses', {}).get('status5_keywords', [])
     if isinstance(status5_keywords_config, list):
         status5_keywords = [str(keyword).strip() for keyword in status5_keywords_config if str(keyword).strip()]
@@ -352,6 +393,11 @@ def _run_lm_postprocess(conn, run_talent: bool = True, run_project: bool = True)
         interval_work_seconds=lmstudio_interval_work_seconds,
         interval_rest_seconds=lmstudio_interval_rest_seconds,
         reload_interval_seconds=lmstudio_reload_interval_seconds,
+        process_restart_enabled=lmstudio_process_restart_enabled,
+        provider=llm_provider,
+        process_name=lmstudio_process_name,
+        process_start_command=lmstudio_process_start_command,
+        process_startup_wait_seconds=lmstudio_process_startup_wait_seconds,
         status5_keywords=status5_keywords,
     )
     logger.info(f'LM後処理結果: success={lm_success}, error={lm_error}')
@@ -368,6 +414,29 @@ def _run_delete_old_records(conn) -> tuple[int, int, int, int]:
         f'matches={deleted_matches}件, run_history={deleted_history}件'
     )
     return deleted_talent, deleted_project, deleted_matches, deleted_history
+
+
+def _strip_matches_reason_for_copied_db(db_path: Path) -> None:
+    """コピー先DBのmatches.reasonをNULL化してサイズ削減を試みます。"""
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='matches' LIMIT 1"
+            )
+            if cur.fetchone() is None:
+                logger.warning(f'コピー先DBにmatchesテーブルが存在しないためreason削除をスキップします: {db_path}')
+                return
+
+            cur.execute('UPDATE matches SET reason = NULL')
+            updated_count = cur.rowcount if cur.rowcount is not None else 0
+            conn.commit()
+            logger.info(f'コピー先DBのmatches.reasonをNULL化しました: {db_path}, updated={updated_count}')
+
+            cur.execute('VACUUM')
+            logger.info(f'コピー先DBのVACUUMを実行しました: {db_path}')
+    except Exception as ex:
+        logger.warning(f'コピー先DBのmatches.reason削除またはVACUUMに失敗しました: {db_path}, error={ex}')
 
 
 def _run_csv_export(conn) -> None:
@@ -434,6 +503,7 @@ def _run_csv_export(conn) -> None:
         try:
             shutil.copy2(db_source_path, target_path)
             logger.info(f'DBコピー完了: {db_source_path} -> {target_path}')
+            _strip_matches_reason_for_copied_db(target_path)
         except Exception as ex:
             logger.warning(f'DBコピーに失敗しました: {db_source_path} -> {target_path}, error={ex}')
 
@@ -448,9 +518,18 @@ def _run_matching_only(conn) -> dict[str, int]:
     if not isinstance(matching_multiprocess_enabled, bool):
         logger.warning('config.matching.multiprocess_enabled は bool を指定してください。default=false を使用します。')
         matching_multiprocess_enabled = False
+    matching_save_reason_in_db = matching_config.get('save_reason_in_db', True)
+    if not isinstance(matching_save_reason_in_db, bool):
+        logger.warning('config.matching.save_reason_in_db は bool を指定してください。default=true を使用します。')
+        matching_save_reason_in_db = True
     matching_num_workers = max(1, int(matching_config.get('num_workers', 1)))
     matching_chunk_size = max(1, int(matching_config.get('chunk_size', 50)))
     matching_talent_log_interval = max(1, int(matching_config.get('talent_log_interval', 100)))
+    try:
+        matching_low_score_threshold = max(0, min(100, int(matching_config.get('delete_low_score_threshold', 50))))
+    except (TypeError, ValueError):
+        logger.warning('config.matching.delete_low_score_threshold は 0-100 の整数を指定してください。default=50 を使用します。')
+        matching_low_score_threshold = 50
 
     expired_talent, expired_project = expire_matching_target_records(
         conn,
@@ -466,18 +545,21 @@ def _run_matching_only(conn) -> dict[str, int]:
         match_stats = process_all_matches(
             conn,
             use_multiprocessing=matching_multiprocess_enabled,
+            save_reason_in_db=matching_save_reason_in_db,
             num_workers=matching_num_workers,
             chunk_size=matching_chunk_size,
             talent_log_interval=matching_talent_log_interval,
+            delete_low_score_threshold=matching_low_score_threshold,
         )
         logger.info(
             f'マッチング処理完了: total={match_stats["total_matches"]}, '
             f'added={match_stats["added"]}, '
+            f'low_score_deleted={match_stats["low_score_deleted"]}, '
             f'expired_talent={expired_talent}, expired_project={expired_project}'
         )
         return match_stats
     except Exception as e:
-        logger.error(f'マッチング処理失敗: {e}')
+        logger.error('マッチング処理失敗: %s (%r)', e, e, exc_info=True)
         raise
 
 
@@ -488,98 +570,104 @@ if __name__ == '__main__':
     process_plan = _resolve_process_plan(args, process_config)
 
     db_path = config.get('mailbox', {}).get('db_path', 'DB/mails.db')
-    conn = init_db(db_path)
+    db_lock_timeout_seconds = _resolve_db_lock_timeout_seconds()
     result_counts_logger = _build_result_counts_logger()
 
     try:
-        logger.info(f'実行モード: {mode}')
-        logger.info(f'実行プラン: {process_plan}')
-        end = None
-
-        if process_plan['mail_fetch']:
+        with advisory_db_lock(db_path, timeout_seconds=db_lock_timeout_seconds):
+            logger.info(f'DBロック取得: path={db_path}, timeout={db_lock_timeout_seconds}s')
+            conn = init_db(db_path)
             try:
-                access_token = _acquire_access_token()
-                end, mail_project_count, mail_talent_count, mail_status2_count, mail_status3_count = _run_mail_fetch(conn, access_token)
-                _log_result_counts(
-                    result_counts_logger,
-                    f'process=mail status=success mail_project={mail_project_count} mail_talent={mail_talent_count} status2={mail_status2_count} status3={mail_status3_count}',
-                )
-            except Exception as e:
-                _log_result_counts(
-                    result_counts_logger,
-                    f'process=mail status=failed error={str(e).replace(" ", "_")}',
-                )
-                raise
-        else:
-            logger.info('メール取得は設定によりスキップされました。')
-            _log_result_counts(result_counts_logger, 'process=mail status=skipped')
+                logger.info(f'実行モード: {mode}')
+                logger.info(f'実行プラン: {process_plan}')
+                end = None
 
-        if process_plan['lm_postprocess_talent'] or process_plan['lm_postprocess_project']:
-            try:
-                lm_success, lm_error, lm_talent_count, lm_project_count = _run_lm_postprocess(
-                    conn,
-                    run_talent=process_plan['lm_postprocess_talent'],
-                    run_project=process_plan['lm_postprocess_project'],
-                )
-                _log_result_counts(
-                    result_counts_logger,
-                    f'process=lm status=success lm_project={lm_project_count} lm_talent={lm_talent_count} lm_success={lm_success} lm_error={lm_error}',
-                )
-            except Exception as e:
-                _log_result_counts(
-                    result_counts_logger,
-                    f'process=lm status=failed error={str(e).replace(" ", "_")}',
-                )
-                raise
-        else:
-            logger.info('LM後処理は設定によりスキップされました。')
-            _log_result_counts(result_counts_logger, 'process=lm status=skipped')
+                if process_plan['mail_fetch']:
+                    try:
+                        access_token = _acquire_access_token()
+                        end, mail_project_count, mail_talent_count, mail_status2_count, mail_status3_count = _run_mail_fetch(conn, access_token)
+                        _log_result_counts(
+                            result_counts_logger,
+                            f'process=mail status=success mail_project={mail_project_count} mail_talent={mail_talent_count} status2={mail_status2_count} status3={mail_status3_count}',
+                        )
+                    except Exception as e:
+                        _log_result_counts(
+                            result_counts_logger,
+                            f'process=mail status=failed error={str(e).replace(" ", "_")}',
+                        )
+                        raise
+                else:
+                    logger.info('メール取得は設定によりスキップされました。')
+                    _log_result_counts(result_counts_logger, 'process=mail status=skipped')
 
-        if process_plan['matching']:
-            try:
-                match_stats = _run_matching_only(conn)
-                _log_result_counts(
-                    result_counts_logger,
-                    f'process=matching status=success matching_total={match_stats["total_matches"]} matching_added={match_stats["added"]}',
-                )
-            except Exception as e:
-                _log_result_counts(
-                    result_counts_logger,
-                    f'process=matching status=failed error={str(e).replace(" ", "_")}',
-                )
-                raise
-        else:
-            logger.info('マッチング処理は設定によりスキップされました。')
-            _log_result_counts(result_counts_logger, 'process=matching status=skipped')
+                if process_plan['lm_postprocess_talent'] or process_plan['lm_postprocess_project']:
+                    try:
+                        lm_success, lm_error, lm_talent_count, lm_project_count = _run_lm_postprocess(
+                            conn,
+                            run_talent=process_plan['lm_postprocess_talent'],
+                            run_project=process_plan['lm_postprocess_project'],
+                        )
+                        _log_result_counts(
+                            result_counts_logger,
+                            f'process=lm status=success lm_project={lm_project_count} lm_talent={lm_talent_count} lm_success={lm_success} lm_error={lm_error}',
+                        )
+                    except Exception as e:
+                        _log_result_counts(
+                            result_counts_logger,
+                            f'process=lm status=failed error={str(e).replace(" ", "_")}',
+                        )
+                        raise
+                else:
+                    logger.info('LM後処理は設定によりスキップされました。')
+                    _log_result_counts(result_counts_logger, 'process=lm status=skipped')
 
-        if end is not None:
-            record_run_at(conn, end)
+                if process_plan['matching']:
+                    try:
+                        match_stats = _run_matching_only(conn)
+                        _log_result_counts(
+                            result_counts_logger,
+                            f'process=matching status=success matching_total={match_stats["total_matches"]} matching_added={match_stats["added"]} matching_low_score_deleted={match_stats["low_score_deleted"]}',
+                        )
+                    except Exception as e:
+                        matching_error = str(e).strip() or repr(e)
+                        _log_result_counts(
+                            result_counts_logger,
+                            f'process=matching status=failed error={matching_error.replace(" ", "_")}',
+                        )
+                        raise
+                else:
+                    logger.info('マッチング処理は設定によりスキップされました。')
+                    _log_result_counts(result_counts_logger, 'process=matching status=skipped')
 
-        if process_plan['delete_old']:
-            try:
-                deleted_talent, deleted_project, deleted_matches, deleted_history = _run_delete_old_records(conn)
-                delete_total = deleted_talent + deleted_project + deleted_matches
-                _log_result_counts(
-                    result_counts_logger,
-                    f'process=delete status=success delete_total={delete_total} delete_talent={deleted_talent} delete_project={deleted_project} delete_matches={deleted_matches} delete_history={deleted_history}',
-                )
-            except Exception as e:
-                _log_result_counts(
-                    result_counts_logger,
-                    f'process=delete status=failed error={str(e).replace(" ", "_")}',
-                )
-                raise
-        else:
-            logger.info('古いレコード削除は設定によりスキップされました。')
-            _log_result_counts(result_counts_logger, 'process=delete status=skipped')
+                if end is not None:
+                    record_run_at(conn, end)
 
-        if process_plan['csv_export']:
-            _run_csv_export(conn)
-        else:
-            logger.info('CSV出力は設定によりスキップされました。')
+                if process_plan['delete_old']:
+                    try:
+                        deleted_talent, deleted_project, deleted_matches, deleted_history = _run_delete_old_records(conn)
+                        delete_total = deleted_talent + deleted_project + deleted_matches
+                        _log_result_counts(
+                            result_counts_logger,
+                            f'process=delete status=success delete_total={delete_total} delete_talent={deleted_talent} delete_project={deleted_project} delete_matches={deleted_matches} delete_history={deleted_history}',
+                        )
+                    except Exception as e:
+                        _log_result_counts(
+                            result_counts_logger,
+                            f'process=delete status=failed error={str(e).replace(" ", "_")}',
+                        )
+                        raise
+                else:
+                    logger.info('古いレコード削除は設定によりスキップされました。')
+                    _log_result_counts(result_counts_logger, 'process=delete status=skipped')
+
+                if process_plan['csv_export']:
+                    _run_csv_export(conn)
+                else:
+                    logger.info('CSV出力は設定によりスキップされました。')
+
+            finally:
+                conn.close()
 
     except Exception as e:
-        logger.error(f'エラー: {e}')
-    finally:
-        conn.close()
+        logger.error('エラー: %s (%r)', e, e, exc_info=True)
 
