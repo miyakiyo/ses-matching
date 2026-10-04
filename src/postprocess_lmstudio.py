@@ -1,10 +1,15 @@
+import csv
 import json
 import logging
 import re
+import subprocess
+import threading
+import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 import sqlite3
@@ -16,9 +21,238 @@ from .matching_engine import process_all_matches
 logger = logging.getLogger(__name__)
 
 
+_LMSTUDIO_MODEL_RELOAD_LOCK = threading.Lock()
+_LMSTUDIO_LAST_RELOAD_MONOTONIC: float | None = None
+
+
+def _truncate_for_log(text: str, limit: int = 4000) -> str:
+    """ログ出力向けに文字列を短縮し、改行を可視化する。"""
+    normalized = str(text).replace("\r", "\\r").replace("\n", "\\n")
+    if len(normalized) <= limit:
+        return normalized
+    remaining = len(normalized) - limit
+    return f"{normalized[:limit]}...<truncated:{remaining} chars>"
+
+
+_KEY_REPLACEMENT_CSV = Path(__file__).resolve().parent.parent / "config" / "key_replacements.csv"
+_KEY_REPLACEMENT_CACHE: dict[str, dict[str, str]] | None = None
+
+
+def _load_key_replacement_map() -> dict[str, dict[str, str]]:
+    """CSVからキー置換表を読み込み、カテゴリ別マップを返す。"""
+    global _KEY_REPLACEMENT_CACHE
+    if _KEY_REPLACEMENT_CACHE is not None:
+        return _KEY_REPLACEMENT_CACHE
+
+    replacements: dict[str, dict[str, str]] = {
+        "ALL": {},
+        "人材": {},
+        "案件": {},
+    }
+
+    if not _KEY_REPLACEMENT_CSV.exists():
+        logger.info("Key replacement CSV not found: path=%s", _KEY_REPLACEMENT_CSV)
+        _KEY_REPLACEMENT_CACHE = replacements
+        return _KEY_REPLACEMENT_CACHE
+
+    with _KEY_REPLACEMENT_CSV.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        required = {"category", "from_key", "to_key"}
+        if not required.issubset(set(reader.fieldnames or [])):
+            logger.warning(
+                "Invalid key replacement CSV header: required=%s, actual=%s",
+                sorted(required),
+                reader.fieldnames,
+            )
+            _KEY_REPLACEMENT_CACHE = replacements
+            return _KEY_REPLACEMENT_CACHE
+
+        for row_no, row in enumerate(reader, start=2):
+            category = (row.get("category") or "").strip()
+            from_key = (row.get("from_key") or "").strip()
+            to_key = (row.get("to_key") or "").strip()
+
+            if not category and not from_key and not to_key:
+                continue
+            if category not in replacements:
+                logger.warning(
+                    "Unknown replacement category: row=%s, category=%s",
+                    row_no,
+                    category,
+                )
+                continue
+            if not from_key or not to_key:
+                logger.warning(
+                    "Invalid replacement row: row=%s, from_key=%s, to_key=%s",
+                    row_no,
+                    from_key,
+                    to_key,
+                )
+                continue
+            if from_key == to_key:
+                continue
+
+            replacements[category][from_key] = to_key
+
+    _KEY_REPLACEMENT_CACHE = replacements
+    return _KEY_REPLACEMENT_CACHE
+
+
+def _resolve_key_replacements_for_category(category: str) -> dict[str, str]:
+    """カテゴリに対応する置換ルール（ALL + category）を返す。"""
+    replacement_map = _load_key_replacement_map()
+    merged = dict(replacement_map.get("ALL", {}))
+    merged.update(replacement_map.get(category, {}))
+    return merged
+
+
+def _apply_key_replacements(
+    properties: dict[str, Any],
+    category: str,
+) -> tuple[dict[str, Any], list[tuple[str, str]], list[tuple[str, str]]]:
+    """抽出プロパティのキー置換を行う。衝突時は既存キーを優先する。"""
+    rules = _resolve_key_replacements_for_category(category)
+    if not rules:
+        return properties, [], []
+
+    source_keys = {str(key) for key in properties.keys()}
+    replaced_items: list[tuple[str, str]] = []
+    collisions: list[tuple[str, str]] = []
+    normalized: dict[str, Any] = {}
+
+    for key, value in properties.items():
+        source_key = str(key)
+        target_key = rules.get(source_key, source_key)
+
+        if target_key != source_key:
+            # 置換先キーが元データに存在する場合は既存キーを優先し、置換元は採用しない。
+            if target_key in source_keys:
+                collisions.append((source_key, target_key))
+                continue
+            if target_key in normalized:
+                collisions.append((source_key, target_key))
+                continue
+            normalized[target_key] = value
+            replaced_items.append((source_key, target_key))
+            continue
+
+        if source_key in normalized:
+            continue
+        normalized[source_key] = value
+
+    return normalized, replaced_items, collisions
+
+
+def _normalize_skill_list_value(value: Any) -> list[str]:
+    """スキル系フィールド値を文字列リストへ正規化します。"""
+    if value is None:
+        return []
+
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    text = str(value).strip()
+    if not text:
+        return []
+
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    parts = re.split(r"[、,，/／・;]+", text)
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _backfill_project_fields_from_required_skills(properties: dict[str, Any]) -> dict[str, Any]:
+    """案件データで必須スキルを関連フィールドへ補完します。"""
+    required_skills = _normalize_skill_list_value(properties.get("必須スキル"))
+    if not required_skills:
+        return properties
+
+    # 現在は必須スキルから他カラムへの補完を行わない。
+    # （開発言語/データベース/OS/クラウドへの自動マージを停止）
+    return properties
+
+
+def _apply_key_replacements_after_lm(
+    json_text: str,
+    properties: dict[str, Any],
+    category: str,
+    table_name: str,
+    record_id: int,
+) -> tuple[str, dict[str, Any]]:
+    """LLM取得後にキー置換を適用し、json_text と properties を整合させる。"""
+    normalized_properties, replaced_items, collisions = _apply_key_replacements(properties, category)
+    if category == "案件":
+        normalized_properties = _backfill_project_fields_from_required_skills(normalized_properties)
+
+    if replaced_items:
+        logger.info(
+            "Key replacements applied: table=%s, id=%s, category=%s, count=%s",
+            table_name,
+            record_id,
+            category,
+            len(replaced_items),
+        )
+    if collisions:
+        logger.warning(
+            "Key replacement collisions skipped (existing key prioritized): table=%s, id=%s, category=%s, collisions=%s",
+            table_name,
+            record_id,
+            category,
+            sorted(set(collisions)),
+        )
+
+    if normalized_properties is properties:
+        return json_text, properties
+
+    try:
+        parsed_json = json.loads(json_text)
+    except json.JSONDecodeError:
+        return json.dumps(normalized_properties, ensure_ascii=False), normalized_properties
+
+    if isinstance(parsed_json, dict):
+        return json.dumps(normalized_properties, ensure_ascii=False), normalized_properties
+
+    if isinstance(parsed_json, list) and parsed_json and isinstance(parsed_json[0], dict):
+        parsed_json[0] = normalized_properties
+        return json.dumps(parsed_json, ensure_ascii=False), normalized_properties
+
+    return json_text, normalized_properties
+
+
+def _normalize_partial_match_keywords(keywords: list[str] | None) -> list[str]:
+    """部分一致判定に使うキーワード一覧を正規化します。"""
+    normalized: list[str] = []
+    for keyword in keywords or []:
+        value = str(keyword).strip()
+        if value:
+            normalized.append(value)
+    return normalized
+
+
+def _find_first_matched_keyword(subject: str, body: str, keywords: list[str]) -> str | None:
+    """subject/body への部分一致で、最初に一致したキーワードを返します。"""
+    if not keywords:
+        return None
+
+    target = f"{str(subject or '').strip()}\n{str(body or '').strip()}"
+    for keyword in keywords:
+        if keyword in target:
+            return keyword
+    return None
+
+
 def _sanitize_text_for_lm_request(text: str) -> str:
     """LM Studio 送信用に、JSONペイロード化で問題になり得る文字を除去する。"""
     normalized = text if isinstance(text, str) else str(text)
+
+    # コードフェンス（```json / ```）が本文中にあると LM Studio の入力パーサが pos 0 でクラッシュする
+    normalized = normalized.replace("```json", "").replace("```", "").strip()
 
     # メーラー由来の自動リンク <https://...> は、そのままだと入力パーサと相性が悪いことがある
     normalized = re.sub(r"<((?:https?|mailto):[^>]+)>", r"\1", normalized)
@@ -653,7 +887,7 @@ def _sanitize_json_like_content(content: str) -> str:
 
     # 例: "https": //example.com/path -> "https://example.com/path"
     normalized = re.sub(
-        r'"(https?)"\s*:\s*(//[^"\],}]+)',
+        r'"(https?)"\s*:\s*(//[^"\],}\[]+)',
         r'"\1:\2"',
         normalized,
     )
@@ -672,6 +906,15 @@ def _sanitize_json_like_content(content: str) -> str:
         normalized,
     )
 
+    # 例: "調整可能時間帯": "[140-180h] -> "調整可能時間帯": "[140-180h]"（閉じクォート欠落）
+    # 値が "[..." で始まり "]" で終わった直後に閉じクォートが無いケースを補正する。
+    # この補正は URL 補正より後、"経験度"修正より前に実行する必要がある。
+    normalized = re.sub(
+        r'(:\s*"\[(?:[^\]"\\]|\\.)*\])(?!\s*"|\s*:)(?=\s*[,}\]])',
+        r'\1"',
+        normalized,
+    )
+
     # 例: "経験度":"...SQL など）}, { -> "経験度":"...SQL など）"}, {
     normalized = re.sub(
         r'(:\s*"[^"\{\}\[\]]*?)\}([\s,]*\{)',
@@ -679,11 +922,29 @@ def _sanitize_json_like_content(content: str) -> str:
         normalized,
     )
 
+    # 例: "歓迎要件": ["...", "...") } , "募集人数": ... -> ... ], "募集人数": ...
+    # 文字列配列の閉じ括弧が誤って } になったケースを補正する。
+    normalized = re.sub(
+        r'(:\s*\[(?:\s*"(?:[^"\\]|\\.)*"\s*,)*\s*"(?:[^"\\]|\\.)*"\s*)\}(?=\s*,\s*"(?:[^"\\]|\\.)+"\s*:)',
+        r'\1]',
+        normalized,
+    )
+
+    # 例: ... "企業情報": {...} ]} -> ... "企業情報": {...}}
+    # 末尾に紛れ込んだ孤立 ] を除去する。
+    normalized = re.sub(
+        r'(\}\s*)\](\s*\}\s*)$',
+        r'\1\2',
+        normalized,
+    )
+
     # 例: "text""] -> "text"]（補正ルール競合で二重クォートになった末尾を畳む）
     normalized = re.sub(r'""(?=\s*[,}\]])', r'"', normalized)
 
     # 例: }"]} のような閉じ構造直後の余剰クォートを除去
-    normalized = re.sub(r'([}\]])"(?=\s*[}\],])', r'\1', normalized)
+    # ただし文字列値内の "]" の後のクォートは除去しない（"[140-180h]" + "}" の誤検知防止）
+    # -> 直前がスペース・カンマ・開き括弧ではなく、正規のJSON構造の閉じとみなされる場合のみ
+    normalized = re.sub(r'(\})"(?=\s*[}\],])', r'\1', normalized)
 
     # 文字列内の生改行などを JSON エスケープへ変換
     # 注：この処理は改行正規化の後に実行すること
@@ -798,6 +1059,13 @@ def _sanitize_json_like_content(content: str) -> str:
         _quote_bare_identifier_in_array,
     )
 
+    # 例: [200名超] / [50代以上] -> ["200名超"] / ["50代以上"]（数字+文字の裸値を文字列化）
+    normalized = _regex_sub_outside_json_strings(
+        normalized,
+        r'(?<=[\[,])\s*(-?\d+(?:\.\d+)?\s*[^\d,\]\[{}":\s\n][^,\]\[{}":\s\n]{0,80})\s*(?=[,\]])',
+        lambda m: f'"{m.group(1).strip()}"',
+    )
+
     # 例: "A": ①B": true -> "A": true, "①B": true
     # 丸数字で始まる値が次キーに崩れているケースを、JSONとして成立する形に補正する。
     normalized = _regex_sub_outside_json_strings(
@@ -903,6 +1171,13 @@ def _sanitize_json_like_content(content: str) -> str:
         normalized,
     )
 
+    # 3.2) 例: "技能情報, "_extra_item_1": ": { -> "技能情報": {（オブジェクト値を持つキーの崩れ）
+    normalized = re.sub(
+        r'"([^"\\,:]{1,120})\s*,\s*"_extra_item_\d+"\s*:\s*":\s*(\{)',
+        r'"\1": \2',
+        normalized,
+    )
+
     # 4) 例: "役職"_extra_item_3": ": "PL" -> "役職": "PL"
     normalized = re.sub(
         r'"([^"\\,:]{1,120})"_extra_item_\d+"\s*:\s*":\s*"([^"\\]*)"',
@@ -980,29 +1255,234 @@ def _load_human_schema_text() -> str:
     return schema_path.read_text(encoding="utf-8")
 
 
+def _resolve_lmstudio_base_url(endpoint: str) -> str:
+    """chat/completions エンドポイントから LM Studio サーバーのベースURLを求める。"""
+    parsed = urlparse(endpoint)
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError(f"Invalid LM Studio endpoint: {endpoint}")
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _reload_lmstudio_model(endpoint: str, model: str, timeout: int) -> None:
+    """LM Studio のモデルを unload -> load して再ロードする。"""
+    base_url = _resolve_lmstudio_base_url(endpoint)
+    list_url = f"{base_url}/api/v1/models"
+    unload_url = f"{base_url}/api/v1/models/unload"
+    load_url = f"{base_url}/api/v1/models/load"
+
+    models_resp = requests.get(list_url, timeout=timeout)
+    models_resp.raise_for_status()
+    models = models_resp.json().get("models", [])
+
+    target_instance_ids: list[str] = []
+    for model_info in models:
+        if not isinstance(model_info, dict):
+            continue
+        key = str(model_info.get("key") or "")
+        selected_variant = str(model_info.get("selected_variant") or "")
+        loaded_instances = model_info.get("loaded_instances") or []
+        matches = key == model or selected_variant == model
+        if not matches:
+            for instance in loaded_instances:
+                if isinstance(instance, dict) and str(instance.get("id") or "") == model:
+                    matches = True
+                    break
+        if not matches:
+            continue
+
+        for instance in loaded_instances:
+            if not isinstance(instance, dict):
+                continue
+            instance_id = str(instance.get("id") or "").strip()
+            if instance_id:
+                target_instance_ids.append(instance_id)
+
+    for instance_id in target_instance_ids:
+        unload_resp = requests.post(
+            unload_url,
+            json={"instance_id": instance_id},
+            timeout=timeout,
+        )
+        unload_resp.raise_for_status()
+
+    load_resp = requests.post(
+        load_url,
+        json={"model": model},
+        timeout=timeout,
+    )
+    load_resp.raise_for_status()
+
+
+def _wait_for_lmstudio_api_ready(endpoint: str, timeout: int, startup_wait_seconds: int) -> bool:
+    """LM Studio API が応答可能になるまで待機する。"""
+    base_url = _resolve_lmstudio_base_url(endpoint)
+    list_url = f"{base_url}/api/v1/models"
+    wait_limit = max(1, int(startup_wait_seconds))
+    deadline = time.monotonic() + wait_limit
+
+    while True:
+        try:
+            response = requests.get(list_url, timeout=max(1, int(timeout)))
+            if response.ok:
+                return True
+        except requests.RequestException:
+            pass
+
+        if time.monotonic() >= deadline:
+            return False
+
+        time.sleep(1)
+
+
+def _restart_lmstudio_process(
+    endpoint: str,
+    timeout: int,
+    process_name: str,
+    process_start_command: str,
+    process_startup_wait_seconds: int,
+) -> bool:
+    """LM Studio プロセスを再起動し、API疎通まで待機する。"""
+    normalized_name = str(process_name).strip()
+    normalized_command = str(process_start_command).strip()
+    startup_wait = max(1, int(process_startup_wait_seconds))
+
+    if not normalized_name:
+        logger.warning("LM Studio process restart skipped: process_name is empty")
+        return False
+    if not normalized_command:
+        logger.warning("LM Studio process restart skipped: process_start_command is empty")
+        return False
+
+    stop_result = subprocess.run(
+        ["taskkill", "/IM", normalized_name, "/F"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if stop_result.returncode == 0:
+        logger.info("LM Studio process stop complete: process=%s", normalized_name)
+    else:
+        logger.warning(
+            "LM Studio process stop warning: process=%s, returncode=%s, stdout=%s, stderr=%s",
+            normalized_name,
+            stop_result.returncode,
+            _truncate_for_log(stop_result.stdout or ""),
+            _truncate_for_log(stop_result.stderr or ""),
+        )
+
+    start_result = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", normalized_command],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if start_result.returncode != 0:
+        logger.warning(
+            "LM Studio process start failed: returncode=%s, stdout=%s, stderr=%s",
+            start_result.returncode,
+            _truncate_for_log(start_result.stdout or ""),
+            _truncate_for_log(start_result.stderr or ""),
+        )
+        return False
+
+    logger.info("LM Studio process start complete; waiting API ready: wait_seconds=%s", startup_wait)
+    if not _wait_for_lmstudio_api_ready(
+        endpoint=endpoint,
+        timeout=timeout,
+        startup_wait_seconds=startup_wait,
+    ):
+        logger.warning("LM Studio API ready wait timeout: wait_seconds=%s", startup_wait)
+        return False
+
+    logger.info("LM Studio process restart complete")
+    return True
+
+
+def _ensure_lmstudio_model_reloaded(
+    endpoint: str,
+    model: str,
+    timeout: int,
+    reload_interval_seconds: int,
+    process_restart_enabled: bool = False,
+    process_name: str = "LM Studio.exe",
+    process_start_command: str = "",
+    process_startup_wait_seconds: int = 30,
+) -> None:
+    """必要なタイミングでLM Studioモデルを再ロードする。"""
+    global _LMSTUDIO_LAST_RELOAD_MONOTONIC
+
+    normalized_interval = max(0, int(reload_interval_seconds))
+    with _LMSTUDIO_MODEL_RELOAD_LOCK:
+        now = time.monotonic()
+        should_reload = _LMSTUDIO_LAST_RELOAD_MONOTONIC is None
+        if not should_reload and normalized_interval > 0:
+            elapsed = now - float(_LMSTUDIO_LAST_RELOAD_MONOTONIC)
+            should_reload = elapsed >= normalized_interval
+
+        if not should_reload:
+            return
+
+        if process_restart_enabled:
+            logger.info(
+                "LM Studio process restart start: process=%s, interval_seconds=%s",
+                process_name,
+                normalized_interval,
+            )
+            restart_ok = _restart_lmstudio_process(
+                endpoint=endpoint,
+                timeout=timeout,
+                process_name=process_name,
+                process_start_command=process_start_command,
+                process_startup_wait_seconds=process_startup_wait_seconds,
+            )
+            if restart_ok:
+                logger.info("LM Studio process restart complete: process=%s", process_name)
+            else:
+                logger.warning("LM Studio process restart skipped/failed; continue processing")
+        else:
+            logger.info(
+                "LM Studio model reload start: model=%s, interval_seconds=%s",
+                model,
+                normalized_interval,
+            )
+            _reload_lmstudio_model(endpoint=endpoint, model=model, timeout=timeout)
+            logger.info("LM Studio model reload complete: model=%s", model)
+
+        _LMSTUDIO_LAST_RELOAD_MONOTONIC = time.monotonic()
+
+
 def _call_lmstudio(
     endpoint: str,
     model: str,
     body_text: str,
     category: str,
     timeout: int = 60,
-    max_tokens: int = 512,
+    max_tokens: int = 8192,
+    signature_trim_chars: int = 300,
+    greeting_trim_chars: int = 100,
 ) -> str:
     """LM Studio に本文を送り、JSON文字列を返します。"""
     if category == "案件":
         case_schema_text = _load_case_schema_text()
         system_content = (
-            "あなたはIT/SES営業メールの案件から情報を抽出するシステムです\n"
-            "必ずJSONスキーマに従って出力してください。\n"
+            "IT/SES営業メールの人材から情報をJSON抽出器\n"
+            "必ずJSONスキーマに従い未記載の項目は必ず null または [] にする\n"
+            "日本語で作成する\n"
+            "【重要】思考過程や挨拶、分析プロセスは一切不要\n"
             "以下のJSONスキーマに従う\n"
+
             f"{case_schema_text}"
         )
     elif category == "人材":
         human_schema_text = _load_human_schema_text()
         system_content = (
-            "あなたはIT/SES営業メールの人材から情報を抽出するシステムです\n"
+            "IT/SES営業メールの人材から情報をJSON抽出器\n"
             "必ずJSONスキーマに従って出力してください。\n"
+            "未記載の項目は必ず null または [] にする。\n"
+            "日本語で作成する。\n"
+            "【重要】思考過程や挨拶、分析プロセスは一切不要\n"
             "以下のJSONスキーマに従う\n"
+            
             f"{human_schema_text}"
         )
     else:
@@ -1010,72 +1490,29 @@ def _call_lmstudio(
 
     body_text = _sanitize_text_for_lm_request(body_text)
     body_text = _strip_problematic_unicode(body_text)
+    # UTF-8 encode→decode で残留不正バイトを確実に除去（LM Studio parse 400 対策）
+    body_text = body_text.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
+    # 挨拶除去：先頭 greeting_trim_chars 文字を削除する
+    if greeting_trim_chars > 0:
+        body_text = body_text[greeting_trim_chars:]
+    # 署名除去：末尾 signature_trim_chars 文字を削除する
+    if signature_trim_chars > 0 and len(body_text) > signature_trim_chars:
+        body_text = body_text[:-signature_trim_chars]
     system_content = _sanitize_text_for_lm_request(system_content)
     system_content = _strip_problematic_unicode(system_content)
 
     prompt = (
-        f"以下は{category}メール本文です。解析して必ずJSONのみを返してください。"
-        "未記載の項目は必ず null または [] にする。\n"
-        "日本語で作成する。\n"
-        "説明文やコードブロックは不要です。\n\n"
         f"本文:\n{body_text}"
-    )
-
-    compact_system_content = (
-        "あなたはJSON抽出器です。"
-        "必ずJSONのみ返してください。"
-        "説明文・コードブロックは禁止。"
-    )
-    compact_prompt_2500 = (
-        f"{category}メール本文から項目を抽出し、JSONのみ返してください。\n"
-        "未記載は null または []。\n\n"
-        f"本文:\n{body_text[:1500]}"
-    )
-    compact_prompt_1200 = (
-        f"{category}メール本文から項目を抽出し、JSONのみ返してください。\n"
-        "未記載は null または []。\n\n"
-        f"本文:\n{body_text[:1200]}"
-    )
-    compact_prompt_600 = (
-        f"{category}メール本文から項目を抽出し、JSONのみ返してください。\n"
-        "未記載は null または []。\n\n"
-        f"本文:\n{body_text[:600]}"
-    )
-    ultra_safe_body_text = _strip_problematic_unicode(body_text)
-    compact_prompt_300_safe = (
-        f"{category}メール本文から項目を抽出し、JSONのみ返してください。\n"
-        "未記載は null または []。\n\n"
-        f"本文:\n{ultra_safe_body_text[:300]}"
-    )
-    # 一部のサーバー実装で本文先頭が JSON 断片だと parse input 400 を返すことがあるため、
-    # 最終手段として波括弧を中立化した本文も用意する。
-    ultra_safe_neutralized_body_text = ultra_safe_body_text.replace("{", "（").replace("}", "）")
-    compact_prompt_300_neutralized = (
-        f"{category}メール本文から項目を抽出し、JSONのみ返してください。\n"
-        "未記載は null または []。\n\n"
-        f"本文:\n{ultra_safe_neutralized_body_text[:300]}"
     )
 
     request_variants: list[tuple[str, str]] = []
 
-    # system プロンプト（スキーマ全文）が長すぎると n_keep 超過を起こすため、
-    # 長文時は初回から軽量 system 指示を利用する。
-    use_heavy_system_prompt = len(system_content) <= 2000
-    primary_system_content = system_content if use_heavy_system_prompt else compact_system_content
+    request_variants.append((system_content, prompt))
 
-    request_variants.append((primary_system_content, prompt))
-
-    shortened_prompt = prompt[:12000]
+    shortened_prompt = prompt[:4000]
     if shortened_prompt != prompt:
-        # 長文ケース向けの短縮版
-        request_variants.append((primary_system_content, shortened_prompt))
-
-    # 400 parse input 向けの軽量フォールバック（常に最後に用意）
-    request_variants.append((compact_system_content, compact_prompt_2500))
-    request_variants.append((compact_system_content, compact_prompt_1200))
-    request_variants.append((compact_system_content, compact_prompt_600))
-    request_variants.append((compact_system_content, compact_prompt_300_safe))
-    request_variants.append((compact_system_content, compact_prompt_300_neutralized))
+        # 長文ケース向けの短縮版（num_ctx=8192 を超えないよう上限を抑制）
+        request_variants.append((system_content, shortened_prompt))
 
     resp: requests.Response | None = None
     last_http_error: requests.HTTPError | None = None
@@ -1087,8 +1524,10 @@ def _call_lmstudio(
                 {"role": "system", "content": system_variant},
                 {"role": "user", "content": prompt_variant},
             ],
-            "temperature": 0.0,
+            # "temperature": 0.3,
+            # "presence_penalty": 0.1,
             "max_tokens": max_tokens,
+            # "response_format": { "type": "json_object" }
         }
 
         resp = requests.post(endpoint, json=payload, timeout=timeout)
@@ -1106,15 +1545,19 @@ def _call_lmstudio(
         )
         can_retry_with_shorter_prompt = i < len(request_variants) - 1
 
-        if is_retryable_400 and can_retry_with_shorter_prompt:
+        if is_retryable_400:
             logger.warning(
-                "LM Studio API retryable error: status=%s, body=%s",
+                "LM Studio API retryable error: variant=%s/%s, status=%s, body=%s",
+                i + 1,
+                len(request_variants),
                 resp.status_code,
                 resp.text,
             )
         else:
             logger.error(
-                "LM Studio API error: status=%s, body=%s",
+                "LM Studio API error: variant=%s/%s, status=%s, body=%s",
+                i + 1,
+                len(request_variants),
                 resp.status_code,
                 resp.text,
             )
@@ -1125,12 +1568,28 @@ def _call_lmstudio(
             last_http_error = e
             if is_retryable_400 and can_retry_with_shorter_prompt:
                 logger.warning(
-                    "LM Studio request retry with fallback payload: category=%s, chars=%s -> %s",
+                    "LM Studio request retry with fallback payload: category=%s, variant=%s/%s, chars=%s -> %s",
                     category,
+                    i + 1,
+                    len(request_variants),
                     len(prompt_variant),
                     len(request_variants[i + 1][1]),
                 )
                 continue
+
+            if is_retryable_400 and not can_retry_with_shorter_prompt:
+                logger.warning(
+                    "LM Studio request exhausted retryable fallbacks: category=%s, variant=%s/%s; applying API fallback",
+                    category,
+                    i + 1,
+                    len(request_variants),
+                )
+                fallback_obj = {
+                    "raw_content": body_text,
+                    "sanitize_error": "api_input_parse_fallback",
+                    "api_error": (resp.text or str(e))[:1000],
+                }
+                return json.dumps(fallback_obj, ensure_ascii=False)
             raise
 
     if resp is None:
@@ -1145,6 +1604,12 @@ def _call_lmstudio(
         .get("content", "")
         .strip()
     )
+    logger.debug(
+        "LM raw response: category=%s, chars=%s, content=%s",
+        category,
+        len(content),
+        _truncate_for_log(content),
+    )
     if not content:
         raise RuntimeError("LM Studio response content is empty")
 
@@ -1155,7 +1620,6 @@ def _call_lmstudio(
         repaired = _sanitize_json_like_content(content)
         try:
             parsed = json.loads(repaired)
-            logger.warning("JSON parse repaired by sanitizer")
         except json.JSONDecodeError as repaired_error:
             logger.warning(
                 "JSON parse failed (sanitized), applying fallback: content=%s, error=%s",
@@ -1168,7 +1632,14 @@ def _call_lmstudio(
                 "sanitize_error": "fallback_applied_callsite",
             }
             logger.warning("JSON parse fallback applied at call-site")
-    return json.dumps(parsed, ensure_ascii=False)
+    parsed_json_text = json.dumps(parsed, ensure_ascii=False)
+    logger.debug(
+        "LM parsed json: category=%s, chars=%s, json=%s",
+        category,
+        len(parsed_json_text),
+        _truncate_for_log(parsed_json_text),
+    )
+    return parsed_json_text
 
 
 def _process_single_record_for_lm(
@@ -1178,8 +1649,28 @@ def _process_single_record_for_lm(
     category: str,
     timeout: int,
     max_tokens: int,
+    signature_trim_chars: int = 300,
+    greeting_trim_chars: int = 100,
+    reload_interval_seconds: int = 900,
+    process_restart_enabled: bool = False,
+    process_name: str = "LM Studio.exe",
+    process_start_command: str = "",
+    process_startup_wait_seconds: int = 30,
+    provider: str = "lmstudio",
 ) -> tuple[str, dict[str, Any]]:
     """単一レコードのLM問い合わせ結果を返す（DB更新は行わない）。"""
+    if provider == "lmstudio":
+        _ensure_lmstudio_model_reloaded(
+            endpoint=endpoint,
+            model=model,
+            timeout=timeout,
+            reload_interval_seconds=reload_interval_seconds,
+            process_restart_enabled=process_restart_enabled,
+            process_name=process_name,
+            process_start_command=process_start_command,
+            process_startup_wait_seconds=process_startup_wait_seconds,
+        )
+
     attempt_max_tokens = max(1, int(max_tokens))
     last_error: Exception | None = None
     for attempt in range(3):
@@ -1191,6 +1682,8 @@ def _process_single_record_for_lm(
                 category=category,
                 timeout=timeout,
                 max_tokens=attempt_max_tokens,
+                signature_trim_chars=signature_trim_chars,
+                greeting_trim_chars=greeting_trim_chars,
             )
             break
         except RuntimeError as e:
@@ -1230,92 +1723,170 @@ def process_pending_records_with_lmstudio(
     conn: sqlite3.Connection,
     endpoint: str,
     model: str,
-    timeout: int = 60,
-    max_tokens: int = 512,
-    limit_per_table: int = 500,
-    exclude_folders_human: list[str] | None = None,
-    exclude_folders_case: list[str] | None = None,
+    timeout: int = 120,
+    max_tokens: int = 2048,
+    limit_per_table_talent: int = 500,
+    limit_per_table_project: int = 500,
+    exclude_folders_talent: list[str] | None = None,
+    exclude_folders_project: list[str] | None = None,
     enabled_tables: list[str] | None = None,
     run_matching: bool = True,
-    max_workers: int = 4,
-) -> tuple[int, int]:
-    """status='0' のレコードを LM Studio でJSON化して保存します。"""
+    max_workers: int = 1,
+    signature_trim_chars: int = 300,
+    greeting_trim_chars: int = 100,
+    interval_work_seconds: int = 0,
+    interval_rest_seconds: int = 30,
+    reload_interval_seconds: int = 900,
+    process_restart_enabled: bool = False,
+    process_name: str = "LM Studio.exe",
+    process_start_command: str = "",
+    process_startup_wait_seconds: int = 30,
+    status5_keywords: list[str] | None = None,
+    provider: str = "lmstudio",
+) -> tuple[int, int, int, int]:
+    """status='0' のレコードを LM でJSON化して保存します。"""
     total_success = 0
     total_error = 0
+    success_talent = 0
+    success_project = 0
     normalized_workers = max(1, int(max_workers))
-    enabled_tables_set = set(enabled_tables) if enabled_tables else {"mails_human", "mails_case"}
-    normalized_excludes_human = [
+    use_interval = interval_work_seconds > 0 and interval_rest_seconds > 0
+    interval_start_time = time.monotonic()
+    enabled_tables_set = set(enabled_tables) if enabled_tables else {"mails_talent", "mails_project"}
+    normalized_excludes_talent = [
         str(folder_name).strip()
-        for folder_name in (exclude_folders_human or [])
+        for folder_name in (exclude_folders_talent or [])
         if str(folder_name).strip()
     ]
-    normalized_excludes_case = [
+    normalized_excludes_project = [
         str(folder_name).strip()
-        for folder_name in (exclude_folders_case or [])
+        for folder_name in (exclude_folders_project or [])
         if str(folder_name).strip()
     ]
+    normalized_status5_keywords = _normalize_partial_match_keywords(status5_keywords)
 
-    for table_name in ("mails_human", "mails_case"):
+    for table_name in ("mails_project", "mails_talent"):
         if table_name not in enabled_tables_set:
             logger.info(f"LM後処理スキップ: table={table_name}")
             continue
 
         current_excludes = (
-            normalized_excludes_human
-            if table_name == "mails_human"
-            else normalized_excludes_case
+            normalized_excludes_talent
+            if table_name == "mails_talent"
+            else normalized_excludes_project
+        )
+        current_limit = (
+            limit_per_table_talent
+            if table_name == "mails_talent"
+            else limit_per_table_project
         )
         records = get_pending_records(
             conn,
             table_name,
-            limit=limit_per_table,
+            limit=current_limit,
             exclude_folders=current_excludes,
         )
-        category = "人材" if table_name == "mails_human" else "案件"
+        category = "人材" if table_name == "mails_talent" else "案件"
         logger.info(
             f"LM後処理開始: table={table_name}, pending={len(records)}, excluded_folders={current_excludes}, workers={normalized_workers}"
         )
 
         futures: dict[Any, int] = {}
         processed_count = 0
+        record_list = list(records)
         with ThreadPoolExecutor(max_workers=normalized_workers) as executor:
-            for record_id, body_text in records:
-                future = executor.submit(
-                    _process_single_record_for_lm,
-                    endpoint,
-                    model,
-                    body_text,
-                    category,
-                    timeout,
-                    max_tokens,
-                )
-                futures[future] = record_id
-                logger.debug(f"LM処理を投入: table={table_name}, id={record_id}")
+            for batch_start in range(0, len(record_list), normalized_workers):
+                batch = record_list[batch_start:batch_start + normalized_workers]
+                batch_futures: dict[Any, tuple[int, str, str]] = {}
+                for record_id, subject_text, body_text in batch:
+                    future = executor.submit(
+                        _process_single_record_for_lm,
+                        endpoint=endpoint,
+                        model=model,
+                        body_text=body_text,
+                        category=category,
+                        timeout=timeout,
+                        max_tokens=max_tokens,
+                        signature_trim_chars=signature_trim_chars,
+                        greeting_trim_chars=greeting_trim_chars,
+                        reload_interval_seconds=reload_interval_seconds,
+                        process_restart_enabled=process_restart_enabled,
+                        process_name=process_name,
+                        process_start_command=process_start_command,
+                        process_startup_wait_seconds=process_startup_wait_seconds,
+                        provider=provider,
+                    )
+                    batch_futures[future] = (record_id, subject_text, body_text)
+                    futures[future] = record_id
+                    logger.debug(f"LM処理を投入: table={table_name}, id={record_id}")
 
-            for future in as_completed(futures):
-                record_id = futures[future]
-                processed_count += 1
-                try:
-                    json_text, first_obj = future.result()
-                    update_record_json_status_and_properties(
-                        conn=conn,
-                        table_name=table_name,
-                        record_id=record_id,
-                        json_data=json_text,
-                        properties=first_obj,
-                        status="1",
-                    )
-                    total_success += 1
-                    logger.info(
-                        f"LM処理成功: table={table_name}, id={record_id}, progress={processed_count}/{len(records)}"
-                    )
-                except Exception as e:
-                    total_error += 1
-                    logger.error(
-                        f"LM処理失敗: table={table_name}, id={record_id}, progress={processed_count}/{len(records)}, error={e}"
-                    )
+                for future in as_completed(batch_futures):
+                    record_id, subject_text, body_text = batch_futures[future]
+                    processed_count += 1
+                    try:
+                        json_text, first_obj = future.result()
+                        json_text, first_obj = _apply_key_replacements_after_lm(
+                            json_text=json_text,
+                            properties=first_obj,
+                            category=category,
+                            table_name=table_name,
+                            record_id=record_id,
+                        )
+                        logger.debug(
+                            "LM save payload: table=%s, id=%s, chars=%s, json=%s",
+                            table_name,
+                            record_id,
+                            len(json_text),
+                            _truncate_for_log(json_text),
+                        )
+                        save_status = "1"
+                        if table_name == "mails_project":
+                            matched_keyword = _find_first_matched_keyword(
+                                subject=subject_text,
+                                body=body_text,
+                                keywords=normalized_status5_keywords,
+                            )
+                            if matched_keyword:
+                                save_status = "5"
+                                logger.info(
+                                    "LM処理後に status=5 を付与: table=%s, id=%s, keyword=%s",
+                                    table_name,
+                                    record_id,
+                                    matched_keyword,
+                                )
 
-        conn.commit()
+                        update_record_json_status_and_properties(
+                            conn=conn,
+                            table_name=table_name,
+                            record_id=record_id,
+                            json_data=json_text,
+                            properties=first_obj,
+                            status=save_status,
+                        )
+                        # 障害時の取りこぼしを避けるため、成功レコードごとに確定する。
+                        conn.commit()
+                        total_success += 1
+                        if table_name == "mails_talent":
+                            success_talent += 1
+                        else:
+                            success_project += 1
+                        logger.info(
+                            f"LM処理成功: table={table_name}, id={record_id}, progress={processed_count}/{len(record_list)}"
+                        )
+                    except Exception as e:
+                        total_error += 1
+                        logger.error(
+                            f"LM処理失敗: table={table_name}, id={record_id}, progress={processed_count}/{len(record_list)}, error={e}"
+                        )
+
+                if use_interval and batch_start + normalized_workers < len(record_list):
+                    elapsed = time.monotonic() - interval_start_time
+                    if elapsed >= interval_work_seconds:
+                        logger.info(
+                            f"インターバル: {elapsed:.1f}秒稼働しました。{interval_rest_seconds}秒間待機します。"
+                        )
+                        time.sleep(interval_rest_seconds)
+                        interval_start_time = time.monotonic()
 
     logger.info(f"LM後処理完了: success={total_success}, error={total_error}")
 
@@ -1325,9 +1896,9 @@ def process_pending_records_with_lmstudio(
             match_stats = process_all_matches(conn)
             logger.info(
                 f"マッチング処理完了: total={match_stats['total_matches']}, "
-                f"added={match_stats['added']}, updated={match_stats['updated']}"
+                f"added={match_stats['added']}, low_score_deleted={match_stats['low_score_deleted']}"
             )
         except Exception as e:
             logger.error(f"マッチング処理失敗: {e}")
     
-    return total_success, total_error
+    return total_success, total_error, success_talent, success_project

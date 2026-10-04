@@ -17,11 +17,27 @@ def classify_ses_subject(subject: str, project_keywords: List[str], talent_keywo
     project_hit = any(k and k.lower() in normalized for k in project_keywords)
     talent_hit = any(k and k.lower() in normalized for k in talent_keywords)
 
-    if project_hit:
-        return "案件"
     if talent_hit:
         return "人材"
+    if project_hit:
+        return "案件"
+
     return "未分類"
+
+
+def should_mark_status2(subject: str, body: str, status2_keywords: List[str]) -> bool:
+    """件名または本文に指定キーワードが含まれるか判定します。
+
+    :param subject: メール件名。
+    :param body: メール本文。
+    :param status2_keywords: status=2 にしたいキーワード一覧。
+    :return: いずれかのキーワードが含まれるなら True。
+    """
+    if not status2_keywords:
+        return False
+
+    normalized = f"{subject or ''}\n{body or ''}".lower()
+    return any(keyword and str(keyword).lower() in normalized for keyword in status2_keywords)
 
 
 def append_unclassified_log(log_path: str, folder: str, subject: str) -> None:
@@ -74,6 +90,24 @@ def should_skip_folder(folder_name: str, not_folder: List[str], not_folder_keywo
     # フォルダ名が除外キーワードを含むかを完全判定する。
     for keyword in not_folder_keywords:
         if keyword and str(keyword).lower() == norm_name:
+            return True
+
+    return False
+
+
+def should_exclude_by_sender_addr(sender_addr: str, exclude_patterns: List[str]) -> bool:
+    """メールアドレスが除外パターンに一致するか判定します。
+
+    :param sender_addr: 判定対象のメールアドレス。
+    :param exclude_patterns: 除外パターンリスト（部分一致、大文字小文字区別なし）。
+    :return: 除外対象なら True、それ以外は False。
+    """
+    if not sender_addr or not exclude_patterns:
+        return False
+
+    normalized_addr = str(sender_addr).lower()
+    for pattern in exclude_patterns:
+        if pattern and str(pattern).lower() in normalized_addr:
             return True
 
     return False

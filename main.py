@@ -2,11 +2,21 @@ from msal import ConfidentialClientApplication
 from datetime import datetime, timezone, timedelta
 import argparse
 import os
+import shutil
+import sqlite3
 import yaml
 import logging
 from pathlib import Path
 
-from src.database_utils import init_db, get_last_run_at, record_run_at, delete_old_records, export_tables_to_csv
+from src.database_utils import (
+    advisory_db_lock,
+    init_db,
+    get_last_run_at,
+    record_run_at,
+    expire_matching_target_records,
+    delete_old_records,
+    export_tables_to_csv,
+)
 from src.classifier_utils import classify_ses_subject, append_unclassified_log
 from src.graph_mail import get_mail_subjects, list_mail_folders
 from src.postprocess_lmstudio import process_pending_records_with_lmstudio
@@ -36,15 +46,40 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+RESULT_COUNTS_LOG_PATH = 'logs/result_counts.log'
+
+
+def _build_result_counts_logger() -> logging.Logger:
+    """結果件数専用ロガーを構築して返します。"""
+    result_logger = logging.getLogger('result_counts')
+    result_logger.setLevel(logging.INFO)
+    result_logger.propagate = False
+    if result_logger.handlers:
+        return result_logger
+
+    result_log_dir = Path(RESULT_COUNTS_LOG_PATH).parent
+    result_log_dir.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(RESULT_COUNTS_LOG_PATH, encoding='utf-8')
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+    result_logger.addHandler(file_handler)
+    return result_logger
+
+
+def _log_result_counts(result_logger: logging.Logger, message: str) -> None:
+    """結果件数ログを1行出力します。"""
+    result_logger.info(message)
+
 NOT_FOLDER = config.get('mailbox', {}).get('not_folder', [])
 NOT_FOLDER_KEYWORDS = config.get('mailbox', {}).get('not_folder_keywords', [])
-LM_EXCLUDE_FOLDERS_HUMAN = config.get('mailbox', {}).get('lm_exclude_folders_human', [])
-LM_EXCLUDE_FOLDERS_CASE = config.get('mailbox', {}).get('lm_exclude_folders_case', [])
+LM_EXCLUDE_FOLDERS_TALENT = config.get('mailbox', {}).get('lm_exclude_folders_talent', [])
+LM_EXCLUDE_FOLDERS_PROJECT = config.get('mailbox', {}).get('lm_exclude_folders_project', [])
+EXCLUDE_SENDER_PATTERNS_TALENT = config.get('mailbox', {}).get('exclude_sender_patterns_talent', [])
+EXCLUDE_SENDER_PATTERNS_PROJECT = config.get('mailbox', {}).get('exclude_sender_patterns_project', [])
 
 PROCESS_DEFAULTS = {
     'mail_fetch': True,
-    'lm_postprocess_human': True,
-    'lm_postprocess_case': True,
+    'lm_postprocess_talent': True,
+    'lm_postprocess_project': True,
     'matching': True,
     'delete_old': True,
     'csv_export': True,
@@ -72,6 +107,17 @@ def _resolve_process_config() -> dict[str, bool]:
         resolved[process_name] = _coerce_process_flag(process_name, raw_value, default)
     return resolved
 
+
+def _resolve_db_lock_timeout_seconds() -> int:
+    """同一DBを使う別プロセス待機時間を設定から解決します。"""
+    mailbox_config = config.get('mailbox', {})
+    raw_timeout = mailbox_config.get('db_lock_timeout_seconds', 900)
+    try:
+        return max(1, int(raw_timeout))
+    except (TypeError, ValueError):
+        logger.warning('config.mailbox.db_lock_timeout_seconds は1以上の整数を指定してください。default=900 を使用します。')
+        return 900
+
 def _parse_args() -> argparse.Namespace:
     """起動引数を解析します。"""
     parser = argparse.ArgumentParser(
@@ -79,7 +125,8 @@ def _parse_args() -> argparse.Namespace:
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument('-m', action='store_true', help='メール取得のみ実行')
-    group.add_argument('-l', action='store_true', help='LM後処理のみ実行')
+    group.add_argument('-lt', action='store_true', help='LM後処理（人材）のみ実行')
+    group.add_argument('-lp', action='store_true', help='LM後処理（案件）のみ実行')
     group.add_argument('-n', action='store_true', help='マッチング処理のみ実行')
     group.add_argument('-d', action='store_true', help='古いレコード削除のみ実行')
     group.add_argument('-c', action='store_true', help='CSV出力のみ実行')
@@ -91,8 +138,10 @@ def _resolve_mode(args: argparse.Namespace) -> str:
     """引数から実行モードを決定します。"""
     if args.m:
         return 'mail'
-    if args.l:
-        return 'lm'
+    if args.lt:
+        return 'lm_talent'
+    if args.lp:
+        return 'lm_project'
     if args.n:
         return 'matching'
     if args.d:
@@ -110,17 +159,26 @@ def _resolve_process_plan(args: argparse.Namespace, process_config: dict[str, bo
     if args.m:
         return {
             'mail_fetch': True,
-            'lm_postprocess_human': False,
-            'lm_postprocess_case': False,
+            'lm_postprocess_talent': False,
+            'lm_postprocess_project': False,
             'matching': False,
             'delete_old': False,
             'csv_export': False,
         }
-    if args.l:
+    if args.lt:
         return {
             'mail_fetch': False,
-            'lm_postprocess_human': True,
-            'lm_postprocess_case': True,
+            'lm_postprocess_talent': True,
+            'lm_postprocess_project': False,
+            'matching': False,
+            'delete_old': False,
+            'csv_export': False,
+        }
+    if args.lp:
+        return {
+            'mail_fetch': False,
+            'lm_postprocess_talent': False,
+            'lm_postprocess_project': True,
             'matching': False,
             'delete_old': False,
             'csv_export': False,
@@ -128,8 +186,8 @@ def _resolve_process_plan(args: argparse.Namespace, process_config: dict[str, bo
     if args.n:
         return {
             'mail_fetch': False,
-            'lm_postprocess_human': False,
-            'lm_postprocess_case': False,
+            'lm_postprocess_talent': False,
+            'lm_postprocess_project': False,
             'matching': True,
             'delete_old': False,
             'csv_export': False,
@@ -137,8 +195,8 @@ def _resolve_process_plan(args: argparse.Namespace, process_config: dict[str, bo
     if args.d:
         return {
             'mail_fetch': False,
-            'lm_postprocess_human': False,
-            'lm_postprocess_case': False,
+            'lm_postprocess_talent': False,
+            'lm_postprocess_project': False,
             'matching': False,
             'delete_old': True,
             'csv_export': False,
@@ -146,8 +204,8 @@ def _resolve_process_plan(args: argparse.Namespace, process_config: dict[str, bo
     if args.c:
         return {
             'mail_fetch': False,
-            'lm_postprocess_human': False,
-            'lm_postprocess_case': False,
+            'lm_postprocess_talent': False,
+            'lm_postprocess_project': False,
             'matching': False,
             'delete_old': False,
             'csv_export': True,
@@ -155,8 +213,8 @@ def _resolve_process_plan(args: argparse.Namespace, process_config: dict[str, bo
     if args.a:
         return {
             'mail_fetch': True,
-            'lm_postprocess_human': True,
-            'lm_postprocess_case': True,
+            'lm_postprocess_talent': True,
+            'lm_postprocess_project': True,
             'matching': True,
             'delete_old': True,
             'csv_export': True,
@@ -206,12 +264,12 @@ def _acquire_access_token() -> str:
     return access_token
 
 
-def _run_mail_fetch(conn, access_token: str) -> datetime:
+def _run_mail_fetch(conn, access_token: str) -> tuple[datetime, int, int, int, int]:
     """メール取得と分類保存を実行します。"""
     mailbox = config.get('mailbox', {}).get('shared_mailbox', '*****@offgrid.co.jp')
     last_run_at = get_last_run_at(conn)
 
-    folders = list_mail_folders(mailbox, access_token)
+    folders = list_mail_folders(mailbox, access_token, token_refresher=_acquire_access_token)
     logger.info('Folders visible via Graph:')
     for name, fid in folders:
         logger.info(f'- {name} {fid}')
@@ -225,7 +283,9 @@ def _run_mail_fetch(conn, access_token: str) -> datetime:
 
     project_keywords = config.get('ses', {}).get('project_keywords', ['案件', '募集'])
     talent_keywords = config.get('ses', {}).get('talent_keywords', ['人材', '要員'])
-    titles = get_mail_subjects(
+    status2_keywords = config.get('ses', {}).get('status2_keywords', [])
+    status3_window_hours = int(config.get('ses', {}).get('status3_window_hours', 48))
+    titles, mail_counts = get_mail_subjects(
         mailbox,
         start,
         end,
@@ -233,8 +293,13 @@ def _run_mail_fetch(conn, access_token: str) -> datetime:
         conn=conn,
         project_keywords=project_keywords,
         talent_keywords=talent_keywords,
+        status2_keywords=status2_keywords,
+        status3_window_hours=status3_window_hours,
         not_folder=NOT_FOLDER,
         not_folder_keywords=NOT_FOLDER_KEYWORDS,
+        exclude_sender_patterns_talent=EXCLUDE_SENDER_PATTERNS_TALENT,
+        exclude_sender_patterns_project=EXCLUDE_SENDER_PATTERNS_PROJECT,
+        token_refresher=_acquire_access_token,
     )
 
     unclassified_log_path = config.get('ses', {}).get('unclassified_log_path', 'logs/unclassified.log')
@@ -245,72 +310,256 @@ def _run_mail_fetch(conn, access_token: str) -> datetime:
             append_unclassified_log(unclassified_log_path, folder, subject)
             logger.info(str((folder, subject, category)))
 
-    return end
+    return (
+        end,
+        mail_counts.get('project', 0),
+        mail_counts.get('talent', 0),
+        mail_counts.get('status2', 0),
+        mail_counts.get('status3', 0),
+    )
 
 
-def _run_lm_postprocess(conn, run_human: bool = True, run_case: bool = True) -> None:
+def _run_lm_postprocess(conn, run_talent: bool = True, run_project: bool = True) -> tuple[int, int, int, int]:
     """LM後処理を実行します。"""
-    if not run_human and not run_case:
+    if not run_talent and not run_project:
         logger.info('LM後処理は設定によりスキップされました。')
-        return
+        return 0, 0, 0, 0
 
-    lmstudio_endpoint = config.get('lmstudio', {}).get('endpoint', 'http://localhost:1234/v1/chat/completions')
-    lmstudio_model = config.get('lmstudio', {}).get('model', 'Qwen2.5-7B-Instruct-GGUF')
-    lmstudio_timeout = int(config.get('lmstudio', {}).get('timeout', 60))
-    lmstudio_max_tokens = max(1, int(config.get('lmstudio', {}).get('max_tokens', 512)))
-    lmstudio_limit = int(config.get('lmstudio', {}).get('limit_per_table', 500))
-    lmstudio_num_workers = max(1, int(config.get('lmstudio', {}).get('num_workers', 4)))
-    lm_exclude_folders_human = [str(name).strip() for name in LM_EXCLUDE_FOLDERS_HUMAN if str(name).strip()]
-    lm_exclude_folders_case = [str(name).strip() for name in LM_EXCLUDE_FOLDERS_CASE if str(name).strip()]
+    _VALID_PROVIDERS = ('lmstudio', 'vllm', 'ollama')
+    llm_provider = str(config.get('llm', {}).get('provider', 'lmstudio')).strip().lower()
+    if llm_provider not in _VALID_PROVIDERS:
+        logger.error(
+            'config.llm.provider に無効な値が指定されました: "%s"。'
+            '有効な値: %s。lmstudio にフォールバックします。',
+            llm_provider, ', '.join(_VALID_PROVIDERS),
+        )
+        llm_provider = 'lmstudio'
+
+    llm_cfg = config.get(llm_provider, {})
+    if not llm_cfg:
+        logger.error(
+            'config.%s セクションが見つかりません。設定を確認してください。',
+            llm_provider,
+        )
+
+    lmstudio_endpoint = str(llm_cfg.get('endpoint', 'http://localhost:1234/v1/chat/completions'))
+    lmstudio_model = str(llm_cfg.get('model', 'Qwen2.5-7B-Instruct-GGUF'))
+    lmstudio_timeout = int(llm_cfg.get('timeout', 60))
+    lmstudio_max_tokens = max(1, int(llm_cfg.get('max_tokens', 512)))
+    lmstudio_limit_talent = int(llm_cfg.get('limit_per_table_talent', 500))
+    lmstudio_limit_project = int(llm_cfg.get('limit_per_table_project', 500))
+    lmstudio_num_workers = max(1, int(llm_cfg.get('num_workers', 4)))
+    lmstudio_signature_trim_chars = max(0, int(llm_cfg.get('signature_trim_chars', 300)))
+    lmstudio_greeting_trim_chars = max(0, int(llm_cfg.get('greeting_trim_chars', 100)))
+    lmstudio_interval_work_seconds = max(0, int(llm_cfg.get('interval_work_seconds', 0)))
+    lmstudio_interval_rest_seconds = max(0, int(llm_cfg.get('interval_rest_seconds', 30)))
+    # LM Studio 固有設定（vllm では使用しないが値として読み込む）
+    lmstudio_cfg = config.get('lmstudio', {})
+    lmstudio_reload_interval_seconds = max(0, int(lmstudio_cfg.get('reload_interval_seconds', 900)))
+    lmstudio_process_restart_enabled = bool(lmstudio_cfg.get('process_restart_enabled', False))
+    lmstudio_process_name = str(lmstudio_cfg.get('process_name', 'LM Studio.exe')).strip() or 'LM Studio.exe'
+    lmstudio_process_start_command = str(lmstudio_cfg.get('process_start_command', '')).strip()
+    lmstudio_process_startup_wait_seconds = max(1, int(lmstudio_cfg.get('process_startup_wait_seconds', 30)))
+    logger.info('LLMプロバイダー: %s, endpoint: %s, model: %s', llm_provider, lmstudio_endpoint, lmstudio_model)
+    status5_keywords_config = config.get('ses', {}).get('status5_keywords', [])
+    if isinstance(status5_keywords_config, list):
+        status5_keywords = [str(keyword).strip() for keyword in status5_keywords_config if str(keyword).strip()]
+    else:
+        logger.warning('config.ses.status5_keywords は list を指定してください。default=[] を使用します。')
+        status5_keywords = []
+    lm_exclude_folders_talent = [str(name).strip() for name in LM_EXCLUDE_FOLDERS_TALENT if str(name).strip()]
+    lm_exclude_folders_project = [str(name).strip() for name in LM_EXCLUDE_FOLDERS_PROJECT if str(name).strip()]
     enabled_tables = []
-    if run_human:
-        enabled_tables.append('mails_human')
-    if run_case:
-        enabled_tables.append('mails_case')
+    if run_talent:
+        enabled_tables.append('mails_talent')
+    if run_project:
+        enabled_tables.append('mails_project')
 
-    lm_success, lm_error = process_pending_records_with_lmstudio(
+    lm_success, lm_error, lm_success_talent, lm_success_project = process_pending_records_with_lmstudio(
         conn=conn,
         endpoint=lmstudio_endpoint,
         model=lmstudio_model,
         timeout=lmstudio_timeout,
         max_tokens=lmstudio_max_tokens,
-        limit_per_table=lmstudio_limit,
-        exclude_folders_human=lm_exclude_folders_human,
-        exclude_folders_case=lm_exclude_folders_case,
+        limit_per_table_talent=lmstudio_limit_talent,
+        limit_per_table_project=lmstudio_limit_project,
+        exclude_folders_talent=lm_exclude_folders_talent,
+        exclude_folders_project=lm_exclude_folders_project,
         enabled_tables=enabled_tables,
         run_matching=False,
         max_workers=lmstudio_num_workers,
+        signature_trim_chars=lmstudio_signature_trim_chars,
+        greeting_trim_chars=lmstudio_greeting_trim_chars,
+        interval_work_seconds=lmstudio_interval_work_seconds,
+        interval_rest_seconds=lmstudio_interval_rest_seconds,
+        reload_interval_seconds=lmstudio_reload_interval_seconds,
+        process_restart_enabled=lmstudio_process_restart_enabled,
+        provider=llm_provider,
+        process_name=lmstudio_process_name,
+        process_start_command=lmstudio_process_start_command,
+        process_startup_wait_seconds=lmstudio_process_startup_wait_seconds,
+        status5_keywords=status5_keywords,
     )
     logger.info(f'LM後処理結果: success={lm_success}, error={lm_error}')
+    return lm_success, lm_error, lm_success_talent, lm_success_project
 
 
-def _run_delete_old_records(conn) -> None:
+def _run_delete_old_records(conn) -> tuple[int, int, int, int]:
     """古いレコード削除を実行します。"""
-    deleted_human, deleted_case, deleted_history = delete_old_records(conn, days=7)
-    logger.info(f'削除完了: mails_human={deleted_human}件, mails_case={deleted_case}件, run_history={deleted_history}件')
+    delete_days = max(1, int(config.get('delete_old', {}).get('days', 7)))
+    deleted_talent, deleted_project, deleted_matches, deleted_history = delete_old_records(conn, days=delete_days)
+    logger.info(
+        f'削除完了: days={delete_days}, '
+        f'mails_talent={deleted_talent}件, mails_project={deleted_project}件, '
+        f'matches={deleted_matches}件, run_history={deleted_history}件'
+    )
+    return deleted_talent, deleted_project, deleted_matches, deleted_history
+
+
+def _strip_matches_reason_for_copied_db(db_path: Path) -> None:
+    """コピー先DBのmatches.reasonをNULL化してサイズ削減を試みます。"""
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='matches' LIMIT 1"
+            )
+            if cur.fetchone() is None:
+                logger.warning(f'コピー先DBにmatchesテーブルが存在しないためreason削除をスキップします: {db_path}')
+                return
+
+            cur.execute('UPDATE matches SET reason = NULL')
+            updated_count = cur.rowcount if cur.rowcount is not None else 0
+            conn.commit()
+            logger.info(f'コピー先DBのmatches.reasonをNULL化しました: {db_path}, updated={updated_count}')
+
+            cur.execute('VACUUM')
+            logger.info(f'コピー先DBのVACUUMを実行しました: {db_path}')
+    except Exception as ex:
+        logger.warning(f'コピー先DBのmatches.reason削除またはVACUUMに失敗しました: {db_path}, error={ex}')
 
 
 def _run_csv_export(conn) -> None:
     """CSV出力を実行します。"""
-    csv_output_dir = config.get('mailbox', {}).get('csv_output_dir', 'csv_exports')
-    exported_files = export_tables_to_csv(conn, csv_output_dir)
+    mailbox_config = config.get('mailbox', {})
+    csv_output_dir = mailbox_config.get('csv_output_dir', 'csv_exports')
+    db_path = mailbox_config.get('db_path', 'DB/mails.db')
+    include_matches_joined = mailbox_config.get('export_matches_joined_csv', True)
+    if not isinstance(include_matches_joined, bool):
+        logger.warning('config.mailbox.export_matches_joined_csv は bool を指定してください。default=true を使用します。')
+        include_matches_joined = True
+
+    raw_copy_destinations = mailbox_config.get('csv_copy_destinations', [])
+    if not isinstance(raw_copy_destinations, list):
+        logger.warning('config.mailbox.csv_copy_destinations は list を指定してください。default=[] を使用します。')
+        raw_copy_destinations = []
+    copy_destinations = [str(path).strip() for path in raw_copy_destinations if str(path).strip()]
+
+    raw_db_copy_destinations = mailbox_config.get('db_copy_destinations', [])
+    if not isinstance(raw_db_copy_destinations, list):
+        logger.warning('config.mailbox.db_copy_destinations は list を指定してください。default=[] を使用します。')
+        raw_db_copy_destinations = []
+    db_copy_destinations = [str(path).strip() for path in raw_db_copy_destinations if str(path).strip()]
+
+    exported_files = export_tables_to_csv(
+        conn,
+        csv_output_dir,
+        include_matches_joined=include_matches_joined,
+    )
     for exported_file in exported_files:
         logger.info(f'CSV出力完了: {exported_file}')
 
+    for destination in copy_destinations:
+        destination_path = Path(destination)
+        if not destination_path.is_dir():
+            logger.warning(f'CSVコピー先ディレクトリが存在しないためスキップします: {destination_path}')
+            continue
 
-def _run_matching_only(conn) -> None:
+        for exported_file in exported_files:
+            source_path = Path(exported_file)
+            if not source_path.exists():
+                logger.warning(f'コピー元CSVが存在しないためスキップします: {source_path}')
+                continue
+
+            target_path = destination_path / source_path.name
+            try:
+                shutil.copy2(source_path, target_path)
+                logger.info(f'CSVコピー完了: {source_path} -> {target_path}')
+            except Exception as ex:
+                logger.warning(f'CSVコピーに失敗しました: {source_path} -> {target_path}, error={ex}')
+
+    db_source_path = Path(db_path)
+    if not db_source_path.exists():
+        logger.warning(f'コピー元DBが存在しないためDBコピーをスキップします: {db_source_path}')
+        return
+
+    for destination in db_copy_destinations:
+        destination_path = Path(destination)
+        if not destination_path.is_dir():
+            logger.warning(f'DBコピー先ディレクトリが存在しないためスキップします: {destination_path}')
+            continue
+
+        target_path = destination_path / db_source_path.name
+        try:
+            shutil.copy2(db_source_path, target_path)
+            logger.info(f'DBコピー完了: {db_source_path} -> {target_path}')
+            _strip_matches_reason_for_copied_db(target_path)
+        except Exception as ex:
+            logger.warning(f'DBコピーに失敗しました: {db_source_path} -> {target_path}, error={ex}')
+
+
+def _run_matching_only(conn) -> dict[str, int]:
     """マッチング処理のみを実行します。"""
     from src.matching_engine import process_all_matches
+    matching_config = config.get('matching', {})
+    ses_config = config.get('ses', {})
+    matching_expire_hours = max(0, int(ses_config.get('matching_expire_hours', 120)))
+    matching_multiprocess_enabled = matching_config.get('multiprocess_enabled', False)
+    if not isinstance(matching_multiprocess_enabled, bool):
+        logger.warning('config.matching.multiprocess_enabled は bool を指定してください。default=false を使用します。')
+        matching_multiprocess_enabled = False
+    matching_save_reason_in_db = matching_config.get('save_reason_in_db', True)
+    if not isinstance(matching_save_reason_in_db, bool):
+        logger.warning('config.matching.save_reason_in_db は bool を指定してください。default=true を使用します。')
+        matching_save_reason_in_db = True
+    matching_num_workers = max(1, int(matching_config.get('num_workers', 1)))
+    matching_chunk_size = max(1, int(matching_config.get('chunk_size', 50)))
+    matching_talent_log_interval = max(1, int(matching_config.get('talent_log_interval', 100)))
+    try:
+        matching_low_score_threshold = max(0, min(100, int(matching_config.get('delete_low_score_threshold', 50))))
+    except (TypeError, ValueError):
+        logger.warning('config.matching.delete_low_score_threshold は 0-100 の整数を指定してください。default=50 を使用します。')
+        matching_low_score_threshold = 50
+
+    expired_talent, expired_project = expire_matching_target_records(
+        conn,
+        expire_hours=matching_expire_hours,
+    )
+    logger.info(
+        f'マッチング期限更新: hours={matching_expire_hours}, '
+        f'expired_talent={expired_talent}, expired_project={expired_project}'
+    )
     
     logger.info('マッチング処理開始...')
     try:
-        match_stats = process_all_matches(conn)
+        match_stats = process_all_matches(
+            conn,
+            use_multiprocessing=matching_multiprocess_enabled,
+            save_reason_in_db=matching_save_reason_in_db,
+            num_workers=matching_num_workers,
+            chunk_size=matching_chunk_size,
+            talent_log_interval=matching_talent_log_interval,
+            delete_low_score_threshold=matching_low_score_threshold,
+        )
         logger.info(
             f'マッチング処理完了: total={match_stats["total_matches"]}, '
-            f'added={match_stats["added"]}, updated={match_stats["updated"]}'
+            f'added={match_stats["added"]}, '
+            f'low_score_deleted={match_stats["low_score_deleted"]}, '
+            f'expired_talent={expired_talent}, expired_project={expired_project}'
         )
+        return match_stats
     except Exception as e:
-        logger.error(f'マッチング処理失敗: {e}')
+        logger.error('マッチング処理失敗: %s (%r)', e, e, exc_info=True)
         raise
 
 
@@ -321,48 +570,104 @@ if __name__ == '__main__':
     process_plan = _resolve_process_plan(args, process_config)
 
     db_path = config.get('mailbox', {}).get('db_path', 'DB/mails.db')
-    conn = init_db(db_path)
+    db_lock_timeout_seconds = _resolve_db_lock_timeout_seconds()
+    result_counts_logger = _build_result_counts_logger()
 
     try:
-        logger.info(f'実行モード: {mode}')
-        logger.info(f'実行プラン: {process_plan}')
-        end = None
+        with advisory_db_lock(db_path, timeout_seconds=db_lock_timeout_seconds):
+            logger.info(f'DBロック取得: path={db_path}, timeout={db_lock_timeout_seconds}s')
+            conn = init_db(db_path)
+            try:
+                logger.info(f'実行モード: {mode}')
+                logger.info(f'実行プラン: {process_plan}')
+                end = None
 
-        if process_plan['mail_fetch']:
-            access_token = _acquire_access_token()
-            end = _run_mail_fetch(conn, access_token)
-        else:
-            logger.info('メール取得は設定によりスキップされました。')
+                if process_plan['mail_fetch']:
+                    try:
+                        access_token = _acquire_access_token()
+                        end, mail_project_count, mail_talent_count, mail_status2_count, mail_status3_count = _run_mail_fetch(conn, access_token)
+                        _log_result_counts(
+                            result_counts_logger,
+                            f'process=mail status=success mail_project={mail_project_count} mail_talent={mail_talent_count} status2={mail_status2_count} status3={mail_status3_count}',
+                        )
+                    except Exception as e:
+                        _log_result_counts(
+                            result_counts_logger,
+                            f'process=mail status=failed error={str(e).replace(" ", "_")}',
+                        )
+                        raise
+                else:
+                    logger.info('メール取得は設定によりスキップされました。')
+                    _log_result_counts(result_counts_logger, 'process=mail status=skipped')
 
-        if process_plan['lm_postprocess_human'] or process_plan['lm_postprocess_case']:
-            _run_lm_postprocess(
-                conn,
-                run_human=process_plan['lm_postprocess_human'],
-                run_case=process_plan['lm_postprocess_case'],
-            )
-        else:
-            logger.info('LM後処理は設定によりスキップされました。')
+                if process_plan['lm_postprocess_talent'] or process_plan['lm_postprocess_project']:
+                    try:
+                        lm_success, lm_error, lm_talent_count, lm_project_count = _run_lm_postprocess(
+                            conn,
+                            run_talent=process_plan['lm_postprocess_talent'],
+                            run_project=process_plan['lm_postprocess_project'],
+                        )
+                        _log_result_counts(
+                            result_counts_logger,
+                            f'process=lm status=success lm_project={lm_project_count} lm_talent={lm_talent_count} lm_success={lm_success} lm_error={lm_error}',
+                        )
+                    except Exception as e:
+                        _log_result_counts(
+                            result_counts_logger,
+                            f'process=lm status=failed error={str(e).replace(" ", "_")}',
+                        )
+                        raise
+                else:
+                    logger.info('LM後処理は設定によりスキップされました。')
+                    _log_result_counts(result_counts_logger, 'process=lm status=skipped')
 
-        if process_plan['matching']:
-            _run_matching_only(conn)
-        else:
-            logger.info('マッチング処理は設定によりスキップされました。')
+                if process_plan['matching']:
+                    try:
+                        match_stats = _run_matching_only(conn)
+                        _log_result_counts(
+                            result_counts_logger,
+                            f'process=matching status=success matching_total={match_stats["total_matches"]} matching_added={match_stats["added"]} matching_low_score_deleted={match_stats["low_score_deleted"]}',
+                        )
+                    except Exception as e:
+                        matching_error = str(e).strip() or repr(e)
+                        _log_result_counts(
+                            result_counts_logger,
+                            f'process=matching status=failed error={matching_error.replace(" ", "_")}',
+                        )
+                        raise
+                else:
+                    logger.info('マッチング処理は設定によりスキップされました。')
+                    _log_result_counts(result_counts_logger, 'process=matching status=skipped')
 
-        if end is not None:
-            record_run_at(conn, end)
+                if end is not None:
+                    record_run_at(conn, end)
 
-        if process_plan['delete_old']:
-            _run_delete_old_records(conn)
-        else:
-            logger.info('古いレコード削除は設定によりスキップされました。')
+                if process_plan['delete_old']:
+                    try:
+                        deleted_talent, deleted_project, deleted_matches, deleted_history = _run_delete_old_records(conn)
+                        delete_total = deleted_talent + deleted_project + deleted_matches
+                        _log_result_counts(
+                            result_counts_logger,
+                            f'process=delete status=success delete_total={delete_total} delete_talent={deleted_talent} delete_project={deleted_project} delete_matches={deleted_matches} delete_history={deleted_history}',
+                        )
+                    except Exception as e:
+                        _log_result_counts(
+                            result_counts_logger,
+                            f'process=delete status=failed error={str(e).replace(" ", "_")}',
+                        )
+                        raise
+                else:
+                    logger.info('古いレコード削除は設定によりスキップされました。')
+                    _log_result_counts(result_counts_logger, 'process=delete status=skipped')
 
-        if process_plan['csv_export']:
-            _run_csv_export(conn)
-        else:
-            logger.info('CSV出力は設定によりスキップされました。')
+                if process_plan['csv_export']:
+                    _run_csv_export(conn)
+                else:
+                    logger.info('CSV出力は設定によりスキップされました。')
+
+            finally:
+                conn.close()
 
     except Exception as e:
-        logger.error(f'エラー: {e}')
-    finally:
-        conn.close()
+        logger.error('エラー: %s (%r)', e, e, exc_info=True)
 
