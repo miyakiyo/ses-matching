@@ -18,6 +18,15 @@ mailbox:
   export_matches_joined_csv: true  # matches_joined.csv の出力可否
   csv_copy_destinations: []  # CSV出力後のコピー先ディレクトリ（複数指定可）
   db_copy_destinations: []  # CSV出力後のDBコピー先ディレクトリ（複数指定可）
+  db_sftp_destinations: []  # CSV出力後のDBコピー先（SFTP / Linuxサーバー等、複数指定可）
+  # db_sftp_destinations:
+  #   - host: 192.168.0.10  # 接続先ホスト
+  #     port: 22  # SSHポート（省略時 22）
+  #     username: ubuntu  # SSHユーザー
+  #     key_file: ~/.ssh/id_ed25519  # 秘密鍵ファイルのパス
+  #     remote_dir: /home/ubuntu/ses-matching/DB  # アップロード先ディレクトリ（事前に作成しておくこと）
+  #     known_hosts_file: ~/.ssh/known_hosts  # 追加で読み込む known_hosts（省略可）
+  #     auto_add_host_key: false  # true の場合、未知のホスト鍵を自動登録（非推奨）
   db_path: DB/mails.db  # SQLite データベースファイルのパス
 
 # 処理実行フラグ（CLI未指定時に適用、CLI指定時はCLIを優先）
