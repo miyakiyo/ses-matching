@@ -4,6 +4,7 @@ import argparse
 import os
 import shutil
 import sqlite3
+import tempfile
 import yaml
 import logging
 from pathlib import Path
@@ -439,6 +440,74 @@ def _strip_matches_reason_for_copied_db(db_path: Path) -> None:
         logger.warning(f'コピー先DBのmatches.reason削除またはVACUUMに失敗しました: {db_path}, error={ex}')
 
 
+def _upload_db_via_sftp(source_path: Path, destination: dict) -> None:
+    """DBファイルをSFTPでリモートサーバーへアップロードします。
+
+    リモート側では一時ファイル名でアップロード後にリネームし、途中状態のDBが参照されないようにします。
+    """
+    import paramiko
+
+    host = str(destination.get('host', '')).strip()
+    username = str(destination.get('username', '')).strip()
+    remote_dir = str(destination.get('remote_dir', '')).strip().rstrip('/')
+    if not host or not username or not remote_dir:
+        raise ValueError('host / username / remote_dir は必須です')
+    port = int(destination.get('port', 22))
+    key_file = destination.get('key_file')
+    key_file = os.path.expanduser(str(key_file)) if key_file else None
+    known_hosts_file = destination.get('known_hosts_file')
+    auto_add_host_key = destination.get('auto_add_host_key', False) is True
+
+    remote_path = f'{remote_dir}/{source_path.name}'
+    remote_tmp_path = f'{remote_path}.uploading'
+
+    with paramiko.SSHClient() as client:
+        client.load_system_host_keys()
+        if known_hosts_file:
+            client.load_host_keys(os.path.expanduser(str(known_hosts_file)))
+        if auto_add_host_key:
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        else:
+            client.set_missing_host_key_policy(paramiko.RejectPolicy())
+
+        client.connect(
+            hostname=host,
+            port=port,
+            username=username,
+            key_filename=key_file,
+            look_for_keys=key_file is None,
+            allow_agent=key_file is None,
+            timeout=30,
+        )
+        with client.open_sftp() as sftp:
+            sftp.put(str(source_path), remote_tmp_path)
+            sftp.posix_rename(remote_tmp_path, remote_path)
+
+    logger.info(f'DB SFTPコピー完了: {source_path} -> {username}@{host}:{port}{remote_path}')
+
+
+def _run_db_sftp_copy(db_source_path: Path, sftp_destinations: list[dict]) -> None:
+    """reason削除済みのDBを一時作成し、各SFTPコピー先へアップロードします。"""
+    if not sftp_destinations:
+        return
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        stripped_db_path = Path(tmp_dir) / db_source_path.name
+        try:
+            shutil.copy2(db_source_path, stripped_db_path)
+            _strip_matches_reason_for_copied_db(stripped_db_path)
+        except Exception as ex:
+            logger.warning(f'SFTP送信用DBの作成に失敗しました: {db_source_path}, error={ex}')
+            return
+
+        for destination in sftp_destinations:
+            label = f"{destination.get('username', '')}@{destination.get('host', '')}:{destination.get('remote_dir', '')}"
+            try:
+                _upload_db_via_sftp(stripped_db_path, destination)
+            except Exception as ex:
+                logger.warning(f'DB SFTPコピーに失敗しました: {db_source_path} -> {label}, error={ex}')
+
+
 def _run_csv_export(conn) -> None:
     """CSV出力を実行します。"""
     mailbox_config = config.get('mailbox', {})
@@ -460,6 +529,14 @@ def _run_csv_export(conn) -> None:
         logger.warning('config.mailbox.db_copy_destinations は list を指定してください。default=[] を使用します。')
         raw_db_copy_destinations = []
     db_copy_destinations = [str(path).strip() for path in raw_db_copy_destinations if str(path).strip()]
+
+    raw_db_sftp_destinations = mailbox_config.get('db_sftp_destinations', [])
+    if not isinstance(raw_db_sftp_destinations, list):
+        logger.warning('config.mailbox.db_sftp_destinations は list を指定してください。default=[] を使用します。')
+        raw_db_sftp_destinations = []
+    db_sftp_destinations = [d for d in raw_db_sftp_destinations if isinstance(d, dict)]
+    if len(db_sftp_destinations) != len(raw_db_sftp_destinations):
+        logger.warning('config.mailbox.db_sftp_destinations に dict 以外の要素があるためスキップします。')
 
     exported_files = export_tables_to_csv(
         conn,
@@ -506,6 +583,8 @@ def _run_csv_export(conn) -> None:
             _strip_matches_reason_for_copied_db(target_path)
         except Exception as ex:
             logger.warning(f'DBコピーに失敗しました: {db_source_path} -> {target_path}, error={ex}')
+
+    _run_db_sftp_copy(db_source_path, db_sftp_destinations)
 
 
 def _run_matching_only(conn) -> dict[str, int]:
@@ -555,6 +634,8 @@ def _run_matching_only(conn) -> dict[str, int]:
             f'マッチング処理完了: total={match_stats["total_matches"]}, '
             f'added={match_stats["added"]}, '
             f'low_score_deleted={match_stats["low_score_deleted"]}, '
+            f'stale_deleted={match_stats["stale_deleted"]}, '
+            f'excluded_by_rule={match_stats["excluded_by_rule"]}, '
             f'expired_talent={expired_talent}, expired_project={expired_project}'
         )
         return match_stats

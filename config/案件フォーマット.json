@@ -10,88 +10,114 @@
         "type": "string",
         "enum": ["案件"]
       },
+      "案件名": {
+        "type": ["string", "null"],
+        "description": "案件の名称（本文中の案件名・概要の見出しを30文字以内で）。記載がなければ null"
+      },
+      "作業場所": {
+        "type": ["string", "null"],
+        "description": "勤務地・最寄駅（例の文字列をそのまま書かない）。記載がなければ null"
+      },
+      "時期": {
+        "type": ["string", "null"],
+        "description": "参画開始時期（本文の表記のまま）。記載がなければ null"
+      },
+      "契約期間": {
+        "type": ["string", "null"],
+        "description": "契約期間（本文の表記のまま）。記載がなければ null"
+      },
+      "募集人数": {
+        "type": ["integer", "null"],
+        "minimum": 1,
+        "description": "募集人数。記載がなければ null"
+      },
       "リモート頻度": {
         "type": "string",
-        "description": "例: フルリモート/週2出社/基本出社 など"
+        "enum": ["フルリモート", "週1出社", "週2出社", "週3出社", "週4出社", "出社", "不明"],
+        "description": "出社頻度を1つだけ選ぶ。常駐・基本出社・リモート記載なしで出社前提は「出社」、リモートに一切触れていなければ「不明」"
       },
       "必須スキル": {
         "type": "array",
         "items": {
           "type": "string"
         },
-        "description": "例: 上流工程, 要件定義, 基本設計, Java, Python, TypeScript など。担当/工程/開発言語/データベース/OS/クラウドの元データとしても利用する。"
+        "description": "「必須」「MUST」と明記された条件だけを、技術名・資格名・短い語（例: Java, Spring Boot, AWS, 要件定義, 基本情報技術者）で入れる。文章は入れない。尚可・歓迎・あれば優遇の条件は入れない"
       },
       "尚可スキル": {
         "type": "array",
         "items": {
           "type": "string"
         },
-        "description": "例: 上流工程, 要件定義, 基本設計, Java, Python, TypeScript など"
+        "description": "「尚可」「歓迎」「あれば尚可」と明記された条件だけを、技術名・短い語で入れる。必須の条件は入れない"
       },
       "担当": {
         "type": "array",
         "items": {
-          "type": "string"
+          "type": "string",
+          "enum": ["PM", "PMO", "リーダー", "SE", "PG", "テスト", "メンバー"]
         },
-        "description": "必須スキルから担当ロールに該当するものを入れる（例: メンバー, テスト, リーダー, PM, PMO）"
+        "description": "求める役割。次の語から本文に該当するものだけを選ぶ（本文にない役割は入れない）"
       },
       "工程": {
         "type": "array",
         "items": {
-          "type": "string"
+          "type": "string",
+          "enum": ["要件定義", "基本設計", "詳細設計", "開発", "テスト", "運用保守"]
         },
-        "description": "必須スキルから工程に該当するものを入れる（例: 要件定義/基本設計/詳細設計/開発/テスト/運用保守）"
+        "description": "担当する工程。次の語から本文に該当するものだけを選ぶ"
       },
       "開発言語": {
         "type": "array",
         "items": {
           "type": "string"
         },
-        "description": "必須スキルから開発言語に該当するものを入れる（例: Java, Python, TypeScript, COBOL）"
+        "description": "プログラミング言語の名前だけ（例: Java, Python, C#, COBOL）。DB・OS・クラウド・フレームワーク・ツールは入れない。必須スキル・尚可スキルのどちらに書かれていても、案件で使う言語を入れる。必須の言語が複数あるときは全部入れる"
       },
       "データベース": {
         "type": "array",
         "items": {
           "type": "string"
         },
-        "description": "必須スキルからデータベースに該当するものを入れる（例: MySQL, PostgreSQL, MongoDB）"
+        "description": "データベース製品名だけ（例: MySQL, PostgreSQL, Oracle, SQL Server）"
       },
       "OS/クラウド": {
         "type": "array",
         "items": {
           "type": "string"
         },
-        "description": "必須スキルからOS/クラウドに該当するものを入れる（例: AWS, Azure, GCP）"
+        "description": "OS名・クラウドサービス名だけ（例: Linux, Windows, AWS, Azure, GCP）"
       },
       "単価下限": {
         "type": ["number", "null"],
         "minimum": 0,
-        "description": "単価下限（数値）。制限がない場合は null"
+        "maximum": 300,
+        "description": "単価の下限。単位は万円（「60〜80万円」なら60。円表記は万円に換算）。記載がなければ null"
       },
       "単価上限": {
         "type": ["number", "null"],
         "minimum": 0,
-        "description": "単価上限（数値）。制限がない場合は null"
+        "maximum": 300,
+        "description": "単価の上限。単位は万円（「60〜80万円」なら80。「〜80万」なら80、下限は null）。記載がなければ null"
       },
       "年齢下限": {
         "type": ["integer", "null"],
-        "minimum": 0,
-        "maximum": 120,
-        "description": "年齢下限（数値）。制限がない場合は null"
+        "minimum": 18,
+        "maximum": 80,
+        "description": "年齢の下限。「30歳以上」の場合のみ。年齢制限の記載がなければ null（0や120は入れない）"
       },
       "年齢上限": {
         "type": ["integer", "null"],
-        "minimum": 0,
-        "maximum": 120,
-        "description": "年齢上限（数値）。制限がない場合は null"
+        "minimum": 18,
+        "maximum": 80,
+        "description": "年齢の上限。「50歳まで」「〜50代」の場合のみ（50歳までなら上限50、下限は null）。年齢制限の記載がなければ null"
       },
       "外国籍可否": {
-        "type": "boolean",
-        "description": "true=可 / false=不可"
+        "type": ["boolean", "null"],
+        "description": "外国籍可なら true、不可なら false。記載がなければ null（推測しない）"
       },
       "個人事業主可否": {
-        "type": "boolean",
-        "description": "true=可 / false=不可"
+        "type": ["boolean", "null"],
+        "description": "個人事業主可なら true、不可なら false。記載がなければ null（推測しない）"
       },
       "契約形態": {
         "type": "string",
@@ -101,16 +127,19 @@
           "請負",
           "その他"
         ],
-        "description": "必要なら選択肢を増減してください"
+        "description": "1つだけ選ぶ。業務委託・準委任契約は「準委任」。記載がなければ「その他」"
       },
       "商流制限_貴社所属迄": {
-        "type": "boolean"
+        "type": ["boolean", "null"],
+        "description": "「貴社所属まで」「御社所属まで」「貴社まで」とあれば true。記載がなければ null"
       },
       "商流制限_営業支援費可": {
-        "type": "boolean"
+        "type": ["boolean", "null"],
+        "description": "営業支援費が可なら true、不可なら false。記載がなければ null"
       },
       "商流制限_浅い方優先": {
-        "type": "boolean"
+        "type": ["boolean", "null"],
+        "description": "商流の浅い方を優先する旨の記載があれば true。記載がなければ null"
       }
     }
   }

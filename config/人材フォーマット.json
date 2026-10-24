@@ -10,66 +10,91 @@
         "type": "string",
         "enum": ["人材"]
       },
+      "名前": {
+        "type": ["string", "null"],
+        "description": "氏名またはイニシャル（本文の表記のまま）。記載がなければ null"
+      },
       "年齢": {
-        "type": "integer",
-        "minimum": 0,
-        "maximum": 120,
-        "description": "年齢（整数のみ）"
+        "type": ["integer", "null"],
+        "minimum": 18,
+        "maximum": 80,
+        "description": "年齢（整数のみ）。記載がなければ null"
       },
       "所属": {
         "type": "string",
-        "description": "弊社所属 / １社下所属 など"
+        "description": "弊社所属 / 1社下所属 / 個人 など、本文の表記のまま。記載がなければ空文字"
       },
       "外国籍": {
-        "type": "boolean",
-        "description": "true=外国籍 / false=日本国籍"
+        "type": ["boolean", "null"],
+        "description": "外国籍なら true、日本国籍なら false。国籍・外国籍の記載がなければ null（推測しない）"
       },
       "個人事業主": {
-        "type": "boolean",
-        "description": "true=個人事業主 / false=法人所属"
+        "type": ["boolean", "null"],
+        "description": "個人事業主・フリーランスなら true、法人所属・社員なら false。記載がなければ null"
       },
       "希望単価": {
-        "type": "number",
+        "type": ["number", "null"],
         "minimum": 0,
-        "description": "希望単価（数値のみ。単位=万円）"
+        "maximum": 300,
+        "description": "希望単価（数値のみ。単位=万円。「70万」なら70。円表記は万円に換算）。記載がなければ null"
+      },
+      "最寄駅": {
+        "type": ["string", "null"],
+        "description": "最寄駅。記載がなければ null"
+      },
+      "稼働可能日": {
+        "type": ["string", "null"],
+        "description": "参画可能時期（本文の表記のまま。例の文字列をそのまま書かない）。記載がなければ null"
       },
       "リモート頻度": {
         "type": "string",
-        "description": "例: フルリモート/週2出社 など"
+        "enum": ["フルリモート", "週1出社", "週2出社", "週3出社", "週4出社", "出社", "不明"],
+        "description": "本人が希望する働き方を1つだけ選ぶ。リモートや出社の希望の記載がなければ「不明」（出社前提と決めつけない）"
       },
       "担当": {
         "type": "array",
-        "items": { "type": "string" },
-        "description": "想定ロール（例: [メンバー, リーダー, SE, PG]）"
+        "items": {
+          "type": "string",
+          "enum": ["PM", "PMO", "リーダー", "SE", "PG", "テスト", "メンバー"]
+        },
+        "description": "経験・希望するロール。次の語から本文に該当するものだけを選ぶ"
       },
       "工程": {
         "type": "array",
-        "items": { "type": "string" },
-        "description": "例: [要件定義, 基本設計, 詳細設計, 開発, テスト, 運用保守]"
+        "items": {
+          "type": "string",
+          "enum": ["要件定義", "基本設計", "詳細設計", "開発", "テスト", "運用保守"]
+        },
+        "description": "経験のある工程。次の語から本文に該当するものだけを選ぶ"
       },
       "開発言語": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "例: Java, Python, TypeScript"
+        "description": "経験のあるプログラミング言語の名前だけ（例: Java, Python, C#, COBOL）。DB・OS・クラウド・フレームワーク・ツールは入れない"
       },
       "OS/クラウド": {
         "type": "array",
         "items": {
           "type": "string"
         },
-        "description": "例: AWS, Azure, GCP など"
+        "description": "経験のあるOS名・クラウドサービス名だけ（例: Linux, Windows, AWS, Azure, GCP）"
       },
       "データベース": {
         "type": "array",
         "items": {
           "type": "string"
         },
-        "description": "例: MySQL, PostgreSQL, MongoDB など"
+        "description": "経験のあるデータベース製品名だけ（例: MySQL, PostgreSQL, Oracle, SQL Server）"
       },
       "スキル": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "その他技術/業務スキル"
+        "description": "上記以外の技術・ツール・フレームワーク・業務スキル（例: Spring Boot, React, Docker, 要件定義）を短い語で。文章は入れない"
+      },
+      "資格": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "保有資格名（例: 基本情報技術者, AWS認定ソリューションアーキテクト）。記載がなければ空配列"
       }
     }
   }
