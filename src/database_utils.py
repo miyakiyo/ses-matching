@@ -209,6 +209,9 @@ def _ensure_columns_exist(conn: sqlite3.Connection, table_name: str, columns: li
         row[1]
         for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
     }
+    if not existing_columns:
+        # テーブルがまだ無い（新規DB）。列は後続の CREATE TABLE で作られる。
+        return
     for column_name, column_definition in columns:
         if column_name in existing_columns:
             continue
