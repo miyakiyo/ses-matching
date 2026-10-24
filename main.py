@@ -634,6 +634,8 @@ def _run_matching_only(conn) -> dict[str, int]:
             f'マッチング処理完了: total={match_stats["total_matches"]}, '
             f'added={match_stats["added"]}, '
             f'low_score_deleted={match_stats["low_score_deleted"]}, '
+            f'stale_deleted={match_stats["stale_deleted"]}, '
+            f'excluded_by_rule={match_stats["excluded_by_rule"]}, '
             f'expired_talent={expired_talent}, expired_project={expired_project}'
         )
         return match_stats

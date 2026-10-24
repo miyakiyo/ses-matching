@@ -1,0 +1,20 @@
+# alias,canonical  (小文字・全角半角統一後の表記で比較する)
+c sharp,c#
+csharp,c#
+c＃,c#
+js,javascript
+ecmascript,javascript
+ts,typescript
+node.js,nodejs
+node,nodejs
+golang,go
+go言語,go
+postgres,postgresql
+ms sql server,sql server
+mssql,sql server
+sqlserver,sql server
+vb,vb.net
+visual basic,vb.net
+python3,python
+k8s,kubernetes
+amazon web services,aws

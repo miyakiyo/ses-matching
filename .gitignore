@@ -39,3 +39,4 @@ ENV/
 
 # CSV export files
 *.csv
+!config/skill_aliases.csv

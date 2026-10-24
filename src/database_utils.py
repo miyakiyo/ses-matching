@@ -487,6 +487,48 @@ def delete_low_score_matches(conn: sqlite3.Connection, threshold: int) -> int:
     return deleted
 
 
+def delete_matches_not_in_pairs(
+    conn: sqlite3.Connection,
+    keep_pairs: list[tuple[int, int]],
+) -> int:
+    """keep_pairs に含まれない matches を削除します。
+
+    マッチングは status='1' の全ペアを毎回再計算するため、今回の結果に出てこない
+    既存行（除外ルールで落ちたペアなど）は古い結果として残さない。
+
+    :param conn: SQLiteコネクション。
+    :param keep_pairs: 今回の計算で残す (talent_id, project_id) の配列。
+    :return: 削除した件数。
+    """
+    try:
+        conn.execute("DROP TABLE IF EXISTS temp.keep_pairs")
+        conn.execute(
+            "CREATE TEMP TABLE keep_pairs (talent_id INTEGER, project_id INTEGER, "
+            "PRIMARY KEY (talent_id, project_id)) WITHOUT ROWID"
+        )
+        conn.executemany(
+            "INSERT OR IGNORE INTO temp.keep_pairs (talent_id, project_id) VALUES (?, ?)",
+            ((int(t), int(p)) for t, p in keep_pairs),
+        )
+        cursor = conn.execute(
+            """
+            DELETE FROM matches
+            WHERE NOT EXISTS (
+                SELECT 1 FROM temp.keep_pairs k
+                WHERE k.talent_id = matches.talent_id
+                  AND k.project_id = matches.project_id
+            )
+            """
+        )
+        deleted = cursor.rowcount if cursor.rowcount is not None else 0
+        conn.execute("DROP TABLE IF EXISTS temp.keep_pairs")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return deleted
+
+
 def expire_matching_target_records(
     conn: sqlite3.Connection,
     expire_hours: int,

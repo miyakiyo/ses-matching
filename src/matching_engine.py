@@ -4,17 +4,30 @@ import os
 import sqlite3
 import re
 import logging
+import unicodedata
 from typing import Optional, Tuple
 from .database_utils import (
     get_talent_record,
     get_project_record,
     add_matches_bulk,
     delete_matches_for_non_active_records,
+    delete_matches_not_in_pairs,
     delete_low_score_matches,
 )
 
 
 logger = logging.getLogger(__name__)
+
+SKILL_ALIASES_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "config",
+    "skill_aliases.csv",
+)
+_skill_aliases_cache: Optional[dict[str, str]] = None
+
+# 単価の妥当範囲（万円）。範囲外は単位ミス・抽出ミスとみなして不明扱いにする。
+PRICE_MAN_MIN = 30.0
+PRICE_MAN_MAX = 300.0
 
 DEFAULT_MATCHING_CHUNK_SIZE = 50
 DEFAULT_TALENT_LOG_INTERVAL = 100
@@ -54,13 +67,41 @@ def _parse_json_array(field) -> list:
     return _normalize_list_value(field, split_plain_text=True)
 
 
+def _load_skill_aliases() -> dict[str, str]:
+    """config/skill_aliases.csv（alias,canonical）を読み込みます。ファイルがなければ空。"""
+    global _skill_aliases_cache
+    if _skill_aliases_cache is not None:
+        return _skill_aliases_cache
+
+    aliases: dict[str, str] = {}
+    try:
+        with open(SKILL_ALIASES_PATH, encoding="utf-8-sig") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) >= 2 and parts[0] and parts[1]:
+                    aliases[unicodedata.normalize("NFKC", parts[0]).lower()] = (
+                        unicodedata.normalize("NFKC", parts[1]).lower()
+                    )
+    except OSError:
+        logger.warning("skill_aliases.csv を読み込めませんでした: %s", SKILL_ALIASES_PATH)
+
+    _skill_aliases_cache = aliases
+    return aliases
+
+
 def _normalize_skill(skill: str) -> str:
-    """スキル名を正規化します（小文字化、前後の空白削除）。
+    """スキル名を正規化します（全角半角統一、小文字化、前後の空白削除、別名の統一）。
 
     :param skill: スキル名。
     :return: 正規化されたスキル名。
     """
-    return skill.strip().lower() if skill else ""
+    if not skill:
+        return ""
+    normalized = unicodedata.normalize("NFKC", str(skill)).strip().lower()
+    return _load_skill_aliases().get(normalized, normalized)
 
 
 def _parse_price_range(price_str: Optional[str]) -> Tuple[Optional[float], Optional[float]]:
@@ -195,27 +236,68 @@ def _parse_optional_bool(value) -> Optional[bool]:
     return None
 
 
+def _normalize_price_man(value) -> Optional[float]:
+    """単価を万円単位へ正規化します。
+
+    円表記（950000）は万円へ換算し、「72万円」「45万前後」のような文字列は数値部分を使う。
+    正規化後に PRICE_MAN_MIN〜PRICE_MAN_MAX の範囲外なら異常値として None を返す。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        text = unicodedata.normalize("NFKC", str(value)).replace(",", "").strip()
+        match = re.search(r"\d+(?:\.\d+)?", text)
+        if not match:
+            return None
+        number = float(match.group(0))
+
+    if number >= 10000:
+        number = number / 10000
+
+    if number < PRICE_MAN_MIN or number > PRICE_MAN_MAX:
+        return None
+    return number
+
+
 def _parse_project_price_range(project_record: dict) -> Tuple[Optional[float], Optional[float]]:
-    """案件レコードから単価下限/単価上限を取得します。"""
-    project_min = _parse_optional_number(project_record.get("単価下限"))
-    project_max = _parse_optional_number(project_record.get("単価上限"))
+    """案件レコードから単価下限/単価上限を取得し、万円単位へ正規化します。"""
+    project_min = _normalize_price_man(project_record.get("単価下限"))
+    project_max = _normalize_price_man(project_record.get("単価上限"))
 
     if project_min is None and project_max is not None:
         project_min = project_max
     if project_max is None and project_min is not None:
         project_max = project_min
 
+    # 下限と上限が逆転している場合は入れ替えて補正する。
+    if project_min is not None and project_max is not None and project_min > project_max:
+        project_min, project_max = project_max, project_min
+
     return (project_min, project_max)
 
 
 def _parse_talent_price_range(talent_price) -> Tuple[Optional[float], Optional[float]]:
-    """人材の希望単価（単一数値）を min/max レンジへ正規化します。"""
-    single_value = _parse_optional_number(talent_price)
+    """人材の希望単価を万円単位の min/max レンジへ正規化します。"""
+    if talent_price is None or isinstance(talent_price, bool):
+        return (None, None)
+
+    if isinstance(talent_price, str):
+        text = unicodedata.normalize("NFKC", talent_price)
+        numbers = re.findall(r"\d[\d,]*(?:\.\d+)?", text)
+        # 「80-100万円」「80〜100」のような範囲表記
+        if len(numbers) >= 2 and re.search(r"\d\s*(?:[-~〜～ー])\s*\d", text):
+            low = _normalize_price_man(numbers[0])
+            high = _normalize_price_man(numbers[1])
+            if low is not None and high is not None:
+                return (min(low, high), max(low, high))
+
+    single_value = _normalize_price_man(talent_price)
     if single_value is not None:
         return (single_value, single_value)
-
-    # 互換性のため、旧データの範囲文字列はフォールバックで解釈する。
-    return _parse_price_range(talent_price)
+    return (None, None)
 
 
 def _match_salary(talent_price: Optional[str], project_record: dict) -> Tuple[bool, int, dict]:
@@ -235,14 +317,18 @@ def _match_salary(talent_price: Optional[str], project_record: dict) -> Tuple[bo
     # 案件予算が人材要望内かチェック
     # 人材の要望 min≦ 案件 max かつ 人材の要望 max≧ 案件 min なら重複範囲あり
     match = talent_min <= project_max and talent_max >= project_min
-    
+
     salary_score = 25 if match else 0
-    
+
     details = {
         "match": match,
         "talent_range": (talent_min, talent_max),
         "project_range": (project_min, project_max),
     }
+
+    # 人材の希望単価の下限が案件の上限を超える（単価逆転）場合は除外対象とする。
+    if talent_min > project_max:
+        details["excluded"] = "price_inversion"
     
     return (match, salary_score, details)
 
@@ -324,6 +410,15 @@ def _parse_multi_value_field(field) -> list[str]:
     return [value.lower() for value in values]
 
 
+def _role_phase_detail(status: str, talent_values: list[str], project_values: list[str], overlap: list[str]) -> dict:
+    """担当・工程の判定詳細を作成します。値は不一致のときだけ含めます。"""
+    detail: dict = {"status": status, "overlap": overlap}
+    if status != "matched":
+        detail["talent_values"] = talent_values
+        detail["project_values"] = project_values
+    return detail
+
+
 def _match_role_and_phase(talent_record: dict, project_record: dict) -> Tuple[bool, int, dict]:
     """担当と工程のマッチング判定を実施します（ソフト制約）。"""
     talent_roles = _parse_multi_value_field(talent_record.get("担当"))
@@ -348,19 +443,11 @@ def _match_role_and_phase(talent_record: dict, project_record: dict) -> Tuple[bo
         phase_status = "unknown"
         phase_score = 0
 
+    # reason を DB に保存するときのサイズを抑えるため、双方の値は一致しなかった場合だけ残す
+    # （一致した場合は overlap で足りる）。
     details = {
-        "role": {
-            "status": role_status,
-            "talent_values": talent_roles,
-            "project_values": project_roles,
-            "overlap": role_overlap,
-        },
-        "phase": {
-            "status": phase_status,
-            "talent_values": talent_phases,
-            "project_values": project_phases,
-            "overlap": phase_overlap,
-        },
+        "role": _role_phase_detail(role_status, talent_roles, project_roles, role_overlap),
+        "phase": _role_phase_detail(phase_status, talent_phases, project_phases, phase_overlap),
     }
 
     return (True, role_score + phase_score, details)
@@ -456,8 +543,123 @@ def _match_age(talent_record: dict, project_record: dict) -> Tuple[bool, int, di
     )
 
 
+REMOTE_FULL = "full_remote"
+REMOTE_HYBRID = "hybrid"
+REMOTE_ONSITE = "onsite"
+REMOTE_UNKNOWN = "unknown"
+
+_REMOTE_UNKNOWN_TOKENS = {"", "[]", "不明", "未記載", "記載なし", "なし", "none", "null", "-", "－"}
+_REMOTE_HYBRID_PATTERN = re.compile(r"週\s*\d\s*(?:日)?\s*(?:程度)?\s*(?:の)?\s*出社|一部|ハイブリッド|併用|月\s*\d\s*回")
+_REMOTE_FULL_PATTERN = re.compile(r"フルリモート|完全リモート|全日リモート|リモート\s*100|100\s*%\s*リモート|完全在宅|フル在宅|リモートのみ|リモート希望|在宅のみ|基本リモート|リモート中心")
+_REMOTE_ONSITE_PATTERN = re.compile(r"出社|常駐|オンサイト|客先|現地")
+_REMOTE_ANY_PATTERN = re.compile(r"リモート|在宅|テレワーク")
+
+
+def _normalize_remote(value) -> str:
+    """リモート頻度の自由文を full_remote / hybrid / onsite / unknown に正規化します。
+
+    判断できない場合は unknown とし、除外には使わない。
+    """
+    if value is None:
+        return REMOTE_UNKNOWN
+    if isinstance(value, (list, tuple)):
+        value = " ".join(str(v) for v in value)
+
+    text = unicodedata.normalize("NFKC", str(value)).strip().lower()
+    if text in _REMOTE_UNKNOWN_TOKENS:
+        return REMOTE_UNKNOWN
+    # プロンプトの例文（「例: フルリモート/週2出社 など」）がそのまま抽出されたもの
+    if "例:" in text or ("など" in text and "/" in text):
+        return REMOTE_UNKNOWN
+
+    if _REMOTE_HYBRID_PATTERN.search(text):
+        return REMOTE_HYBRID
+
+    has_onsite = bool(_REMOTE_ONSITE_PATTERN.search(text))
+    has_remote = bool(_REMOTE_ANY_PATTERN.search(text))
+
+    if _REMOTE_FULL_PATTERN.search(text):
+        # 「フルリモート（出社も可）」のように出社にも触れている場合は断定しない
+        return REMOTE_HYBRID if has_onsite else REMOTE_FULL
+    if has_onsite and has_remote:
+        return REMOTE_HYBRID
+    if has_onsite:
+        return REMOTE_ONSITE
+    if has_remote:
+        return REMOTE_HYBRID
+    return REMOTE_UNKNOWN
+
+
+def _check_remote_exclusion(talent_record: dict, project_record: dict) -> Optional[dict]:
+    """人材がフルリモート希望、かつ案件が出社前提の場合に除外理由を返します。"""
+    talent_remote = _normalize_remote(talent_record.get("リモート頻度"))
+    project_remote = _normalize_remote(project_record.get("リモート頻度"))
+    if talent_remote == REMOTE_FULL and project_remote == REMOTE_ONSITE:
+        return {
+            "rule": "remote_mismatch",
+            "detail": {"talent": talent_remote, "project": project_remote},
+        }
+    return None
+
+
+# 足切りは開発言語のみ。DB・OS/クラウドは人材側の記載が疎で、正しいペアを落とす率が高い（実データで確認）。
+_TECH_GATE_KEYS = ("開発言語",)
+_TALENT_SKILL_KEYS = ("開発言語", "OS/クラウド", "データベース", "スキル", "資格")
+
+
+def _tech_tokens(field) -> set:
+    """技術名の配列項目を正規化したトークン集合へ変換します（「MySQL/MariaDB」のような連結も分割）。"""
+    tokens = set()
+    for item in _parse_json_array(field):
+        for part in re.split(r"[/／・,，、;]+", str(item)):
+            normalized = _normalize_skill(part)
+            if normalized:
+                tokens.add(normalized)
+        whole = _normalize_skill(item)
+        if whole:
+            tokens.add(whole)
+    return tokens
+
+
+def _check_required_tech(talent_record: dict, project_record: dict) -> Optional[dict]:
+    """案件の開発言語に対する足切り判定を行います。
+
+    案件が開発言語を指定しているのに、人材側のスキル情報（言語/スキル/資格など）に
+    重なりがない場合に除外理由を返す（案件内の複数言語はOR）。
+    人材側のスキル情報が全く無い場合、案件の開発言語が空の場合は判断できないため通す。
+    """
+    talent_skills = set()
+    for key in _TALENT_SKILL_KEYS:
+        talent_skills.update(_tech_tokens(talent_record.get(key)))
+    if not talent_skills:
+        return None
+
+    project_by_key = {}
+    for key in _TECH_GATE_KEYS:
+        project_by_key[key] = _tech_tokens(project_record.get(key))
+
+    for key in _TECH_GATE_KEYS:
+        required = project_by_key[key]
+        if required and not (required & talent_skills):
+            return {
+                "rule": "required_tech_mismatch",
+                "detail": {"category": key, "project": sorted(required)},
+            }
+    return None
+
+
+def _excluded_result(rule: dict, reason: dict) -> Tuple[int, dict]:
+    """除外時の返り値（スコア0と除外理由）を作成します。"""
+    reason = dict(reason)
+    reason["excluded"] = rule
+    return (0, reason)
+
+
 def calculate_match_score(talent_record: dict, project_record: dict) -> Tuple[int, dict]:
     """人材と案件のマッチングスコアを計算します。
+
+    除外条件（必須技術名の不一致・単価逆転・年齢範囲外・リモート不一致）に該当する場合は
+    スコア 0 を返し、reason["excluded"] に理由を入れます。
 
     :param talent_record: 人材レコード辞書。
     :param project_record: 案件レコード辞書。
@@ -465,7 +667,13 @@ def calculate_match_score(talent_record: dict, project_record: dict) -> Tuple[in
     """
     total_score = 0
     reason = {}
-    
+
+    # 0. 除外条件（ハードフィルタ）。安価な判定から順に行う。
+    for check in (_check_remote_exclusion, _check_required_tech):
+        excluded = check(talent_record, project_record)
+        if excluded:
+            return _excluded_result(excluded, reason)
+
     # 1. スキルマッチング
     project_required = _parse_json_array(project_record.get("必須スキル"))
     # 案件の開発言語・データベース・OS/クラウドも必須スキルに加える
@@ -502,6 +710,11 @@ def calculate_match_score(talent_record: dict, project_record: dict) -> Tuple[in
         "score": salary_score,
         "details": salary_details,
     }
+    if salary_details.get("excluded"):
+        return _excluded_result(
+            {"rule": salary_details["excluded"], "detail": salary_details},
+            reason,
+        )
     
     # 3. 担当・工程マッチング
     role_phase_match, role_phase_score, role_phase_details = _match_role_and_phase(
@@ -538,7 +751,18 @@ def calculate_match_score(talent_record: dict, project_record: dict) -> Tuple[in
         "score": age_score,
         "details": age_details,
     }
-    
+    # 人材が案件の年齢上限を超えている場合のみ除外する。年齢は抽出のぶれが大きいため、
+    # 下限側の判定と、不明・上限なし（0/120 等の見かけ上の上限を含む）は除外に使わない。
+    talent_age_min = age_details.get("talent_age_min")
+    project_age_max = age_details.get("project_age_max")
+    if (
+        talent_age_min is not None
+        and project_age_max is not None
+        and 0 < project_age_max < 100
+        and talent_age_min > project_age_max
+    ):
+        return _excluded_result({"rule": "age_out_of_range", "detail": age_details}, reason)
+
     # スコアを 0-100 に正規化（最大 100 を超えないように）
     total_score = min(100, total_score)
     
@@ -594,6 +818,7 @@ def _collect_match_rows_for_talent(
     total_matches = 0
     same_sender_skipped = 0
     zero_score_skipped = 0
+    excluded_by_rule: dict[str, int] = {}
     pending_match_rows: list[tuple[int, int, int, Optional[dict]]] = []
 
     for project_id, project_record in project_records:
@@ -606,6 +831,10 @@ def _collect_match_rows_for_talent(
         score, reason = calculate_match_score(talent_record, project_record)
         if score <= 0:
             zero_score_skipped += 1
+            excluded = reason.get("excluded")
+            if excluded:
+                rule_name = str(excluded.get("rule"))
+                excluded_by_rule[rule_name] = excluded_by_rule.get(rule_name, 0) + 1
             continue
 
         if not save_reason_in_db:
@@ -618,7 +847,14 @@ def _collect_match_rows_for_talent(
         "total_matches": total_matches,
         "same_sender_skipped": same_sender_skipped,
         "zero_score_skipped": zero_score_skipped,
+        "excluded_by_rule": excluded_by_rule,
     }
+
+
+def _merge_excluded_counts(total: dict[str, int], addition: dict) -> None:
+    """除外ルール別の件数を加算します。"""
+    for rule_name, count in (addition or {}).items():
+        total[rule_name] = total.get(rule_name, 0) + int(count)
 
 
 def _compute_matches_sequential(
@@ -634,6 +870,7 @@ def _compute_matches_sequential(
     total_matches = 0
     same_sender_skipped = 0
     zero_score_skipped = 0
+    excluded_by_rule: dict[str, int] = {}
     processed_talent_count = 0
 
     normalized_log_interval = max(1, int(talent_log_interval or DEFAULT_TALENT_LOG_INTERVAL))
@@ -653,6 +890,7 @@ def _compute_matches_sequential(
         total_matches += int(talent_stats["total_matches"])
         same_sender_skipped += int(talent_stats["same_sender_skipped"])
         zero_score_skipped += int(talent_stats["zero_score_skipped"])
+        _merge_excluded_counts(excluded_by_rule, talent_stats["excluded_by_rule"])
         processed_talent_count += 1
         if processed_talent_count % normalized_log_interval == 0:
             logger.info(
@@ -666,6 +904,7 @@ def _compute_matches_sequential(
         "total_matches": total_matches,
         "same_sender_skipped": same_sender_skipped,
         "zero_score_skipped": zero_score_skipped,
+        "excluded_by_rule": excluded_by_rule,
     }
 
 
@@ -683,6 +922,7 @@ def _compute_matches_worker(
         total_matches = 0
         same_sender_skipped = 0
         zero_score_skipped = 0
+        excluded_by_rule: dict[str, int] = {}
         completed_talents: list[tuple[int, str]] = []
 
         for talent_id in talent_ids_chunk:
@@ -700,6 +940,7 @@ def _compute_matches_worker(
             total_matches += int(talent_stats["total_matches"])
             same_sender_skipped += int(talent_stats["same_sender_skipped"])
             zero_score_skipped += int(talent_stats["zero_score_skipped"])
+            _merge_excluded_counts(excluded_by_rule, talent_stats["excluded_by_rule"])
             completed_talents.append((talent_id, _get_talent_subject(talent_record)))
 
         return {
@@ -707,6 +948,7 @@ def _compute_matches_worker(
             "total_matches": total_matches,
             "same_sender_skipped": same_sender_skipped,
             "zero_score_skipped": zero_score_skipped,
+            "excluded_by_rule": excluded_by_rule,
             "completed_talents": completed_talents,
         }
     finally:
@@ -752,6 +994,7 @@ def _compute_matches_parallel(
     total_matches = 0
     same_sender_skipped = 0
     zero_score_skipped = 0
+    excluded_by_rule: dict[str, int] = {}
     processed_talent_count = 0
     normalized_log_interval = max(1, int(talent_log_interval or DEFAULT_TALENT_LOG_INTERVAL))
 
@@ -772,6 +1015,7 @@ def _compute_matches_parallel(
             total_matches += int(worker_stats["total_matches"])
             same_sender_skipped += int(worker_stats["same_sender_skipped"])
             zero_score_skipped += int(worker_stats["zero_score_skipped"])
+            _merge_excluded_counts(excluded_by_rule, worker_stats["excluded_by_rule"])
             for talent_id, subject in worker_stats["completed_talents"]:
                 processed_talent_count += 1
                 if processed_talent_count % normalized_log_interval == 0:
@@ -786,6 +1030,7 @@ def _compute_matches_parallel(
         "total_matches": total_matches,
         "same_sender_skipped": same_sender_skipped,
         "zero_score_skipped": zero_score_skipped,
+        "excluded_by_rule": excluded_by_rule,
     }
 
 
@@ -839,6 +1084,11 @@ def process_all_matches(
         )
 
     matches_added = add_matches_bulk(conn, match_stats["rows"])
+    # 今回の計算結果に出てこない既存行（除外ルールで落ちたペア等）を削除する。
+    stale_deleted = delete_matches_not_in_pairs(
+        conn,
+        [(row[0], row[1]) for row in match_stats["rows"] if int(row[2]) > 0],
+    )
     low_score_deleted = delete_low_score_matches(conn, delete_low_score_threshold)
 
     # 一括保存では INSERT/UPDATE を区別せず、保存件数を added として返す。
@@ -849,6 +1099,8 @@ def process_all_matches(
         "low_score_deleted": low_score_deleted,
         "same_sender_skipped": int(match_stats["same_sender_skipped"]),
         "zero_score_skipped": int(match_stats["zero_score_skipped"]),
+        "stale_deleted": stale_deleted,
+        "excluded_by_rule": match_stats["excluded_by_rule"],
     }
 
 
