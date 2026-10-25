@@ -32,6 +32,8 @@ PRICE_MAN_MAX = 300.0
 # スキルの点数: 案件の技術名がすべて一致 / 半分以上一致
 SKILL_SCORE_ALL = 50
 SKILL_SCORE_HALF = 30
+# 必須スキルが全部揃っていないペアの総合点の上限
+MAX_SCORE_WITHOUT_ALL_SKILLS = 99
 
 DEFAULT_MATCHING_CHUNK_SIZE = 50
 DEFAULT_TALENT_LOG_INTERVAL = 100
@@ -146,6 +148,34 @@ def _parse_price_range(price_str: Optional[str]) -> Tuple[Optional[float], Optio
     return (None, None)
 
 
+_ASCII_WORD_PATTERN = re.compile(r"[a-z0-9+#.]+")
+# 日本語の技術名・用語を部分一致で探すときの最小文字数（短すぎる語の誤一致を防ぐ）
+_MIN_JP_SUBSTRING_LENGTH = 3
+_MIN_JP_PHASE_SUBSTRING_LENGTH = 4
+
+
+def _skill_found(required: str, talent_skills: set, talent_jp_skills: list[str]) -> bool:
+    """案件の必須スキル1件を、人材が持っているか判定します。
+
+    完全一致のほか、「AWSにおける設計構築経験」のような文章形式の要件は、
+    英数字の語（AWS）や日本語の用語（要件定義）が人材のスキルにあれば一致とみなす。
+    英数字の語は単語として比較するため、Java と JavaScript は区別される。
+    """
+    if required in talent_skills:
+        return True
+    words = {w.strip(".") for w in _ASCII_WORD_PATTERN.findall(required)}
+    if words & talent_skills:
+        return True
+    return any(skill in required for skill in talent_jp_skills)
+
+
+def _requirement_items(items: list) -> set:
+    """案件の要件（配列の各要素）を、分割せずに正規化した集合にします。"""
+    normalized = {_normalize_skill(item) for item in items}
+    normalized.discard("")
+    return normalized
+
+
 def _match_skills(
     talent_skills_dict: dict,
     project_required_skills: list,
@@ -153,24 +183,31 @@ def _match_skills(
 ) -> Tuple[bool, int, dict]:
     """スキルマッチング判定を実施します。
 
-    案件の技術名（開発言語・DB・OS/クラウド）のうち、人材が持っている割合で点数を決める。
+    案件の必須スキル・開発言語・DB・OS/クラウドのうち、人材が持っている割合で点数を決める。
     すべて持っていれば 50 点、半分以上なら 30 点、それ未満は 0 点。尚可スキルは点数に含めない。
 
-    :param talent_skills_dict: 人材スキル情報（"開発言語", "OS/クラウド", "データベース", "スキル", "資格"キーを持つ辞書）。
-    :param project_required_skills: 案件の技術名（リスト）。
+    :param talent_skills_dict: 人材スキル情報（"開発言語", "OS/クラウド", "データベース", "スキル", "資格", "工程"キーを持つ辞書）。
+    :param project_required_skills: 案件の必須スキル・技術名（リスト）。
     :param project_preferred_skills: 案件の尚可スキル（リスト。詳細表示用で、点数には含めない）。
     :return: (マッチ判定, スコア加点, 詳細情報) の3要素タプル。
     """
     talent_all_skills = set()
-    for key in _TALENT_SKILL_KEYS:
-        talent_all_skills |= _tech_tokens(talent_skills_dict.get(key))
+    talent_jp_skills: list[str] = []
+    for key in _SKILL_POOL_KEYS:
+        tokens = _tech_tokens(talent_skills_dict.get(key))
+        talent_all_skills |= tokens
+        # 工程（開発・テストなど）は短い語が多く、部分一致だと誤って一致しやすいため、長い語だけを対象にする
+        min_length = _MIN_JP_PHASE_SUBSTRING_LENGTH if key == "工程" else _MIN_JP_SUBSTRING_LENGTH
+        talent_jp_skills.extend(t for t in tokens if len(t) >= min_length and not t.isascii())
 
-    required = _tech_tokens(project_required_skills)
-    preferred = _tech_tokens(project_preferred_skills)
-    required_matches = len(required & talent_all_skills)
-    preferred_matches = len(preferred & talent_all_skills)
+    # 案件側は、文章形式の要件を分割しないよう、1件を1要件として扱う
+    required = _requirement_items(project_required_skills)
+    preferred = _requirement_items(project_preferred_skills)
+    missing = sorted(r for r in required if not _skill_found(r, talent_all_skills, talent_jp_skills))
+    required_matches = len(required) - len(missing)
+    preferred_matches = sum(1 for r in preferred if _skill_found(r, talent_all_skills, talent_jp_skills))
 
-    # 必須（技術名）が無い案件は、割合を計算できないため 0 点
+    # 必須が無い案件は、割合を計算できないため 0 点
     ratio = required_matches / len(required) if required else 0.0
     if ratio >= 1.0:
         skill_score = SKILL_SCORE_ALL
@@ -184,6 +221,7 @@ def _match_skills(
         "required_match": required_ok,
         "required_matches": required_matches,
         "required_count": len(required),
+        "missing": missing[:10],
         "preferred_matches": preferred_matches,
         "preferred_count": len(preferred),
         "talent_skill_count": len(talent_all_skills),
@@ -598,6 +636,8 @@ def _check_remote_exclusion(talent_record: dict, project_record: dict) -> Option
 # 足切りは開発言語のみ。DB・OS/クラウドは人材側の記載が疎で、正しいペアを落とす率が高い（実データで確認）。
 _TECH_GATE_KEYS = ("開発言語",)
 _TALENT_SKILL_KEYS = ("開発言語", "OS/クラウド", "データベース", "スキル", "資格")
+# スキル点数の照合では、必須スキルに工程（要件定義など）が書かれることがあるため、人材の工程も含める
+_SKILL_POOL_KEYS = _TALENT_SKILL_KEYS + ("工程",)
 
 
 def _tech_tokens(field) -> set:
@@ -668,9 +708,8 @@ def calculate_match_score(talent_record: dict, project_record: dict) -> Tuple[in
             return _excluded_result(excluded, reason)
 
     # 1. スキルマッチング
-    # 必須スキル欄は文章形式の要件が多く、人材側のスキルと一致しないため使わない。
-    # 案件の開発言語・データベース・OS/クラウドを、一致を見る対象とする。
-    project_required: list = []
+    # 案件の必須スキルに、開発言語・データベース・OS/クラウドを加えたものを、一致を見る対象とする。
+    project_required = _parse_json_array(project_record.get("必須スキル"))
     for key in ["開発言語", "データベース", "OS/クラウド"]:
         project_required.extend(_parse_json_array(project_record.get(key)))
     project_preferred = _parse_json_array(project_record.get("尚可スキル"))
@@ -682,6 +721,7 @@ def calculate_match_score(talent_record: dict, project_record: dict) -> Tuple[in
             "データベース": talent_record.get("データベース"),
             "スキル": talent_record.get("スキル"),
             "資格": talent_record.get("資格"),
+            "工程": talent_record.get("工程"),
         },
         project_required,
         project_preferred,
@@ -762,7 +802,9 @@ def calculate_match_score(talent_record: dict, project_record: dict) -> Tuple[in
         return _excluded_result({"rule": "age_out_of_range", "detail": age_details}, reason)
 
     # スコアを 0-100 に正規化（最大 100 を超えないように）
-    total_score = min(100, total_score)
+    # 必須スキルが全部揃っていない（スキル 50 点でない）場合は、100 点にしない。
+    max_score = 100 if skill_score >= SKILL_SCORE_ALL else MAX_SCORE_WITHOUT_ALL_SKILLS
+    total_score = min(max_score, total_score)
     
     return (total_score, reason)
 
