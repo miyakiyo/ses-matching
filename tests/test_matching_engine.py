@@ -111,12 +111,33 @@ class SkillScoreTest(unittest.TestCase):
         score, _ = calculate_match_score(talent(), project(開発言語=None))
         self.assertGreater(score, 0)
 
-    def test_required_skill_sentences_are_ignored(self):
-        score, _ = calculate_match_score(
-            talent(),
-            project(必須スキル='["AWSにおける設計構築・運用保守経験"]'),
+    def test_score_is_capped_at_99_unless_all_required_found(self):
+        base = {"単価下限": 60, "単価上限": 80, "担当": '["SE"]', "工程": '["開発"]'}
+        t = {"開発言語": '["Java"]', "希望単価": "70", "担当": '["SE"]', "工程": '["開発"]'}
+        half, _ = calculate_match_score(t, {**base, "開発言語": '["Java", "Go"]'})
+        full, _ = calculate_match_score(t, {**base, "開発言語": '["Java"]'})
+        self.assertEqual(half, 99)
+        self.assertEqual(full, 100)
+
+    def test_required_skill_sentence_matches_by_word(self):
+        # 「AWSにおける設計構築経験」は、人材が AWS を持っていれば一致する
+        score, _ = self.score(["AWSにおける設計構築経験"], ["AWS"])
+        self.assertEqual(score, 50)
+
+    def test_required_skill_sentence_without_match_is_0(self):
+        score, details = self.score(["AWSにおける設計構築経験", "Java"], ["Python"])
+        self.assertEqual(score, 0)
+        self.assertEqual(details["missing"], ["awsにおける設計構築経験", "java"])
+
+    def test_java_does_not_match_javascript_in_sentence(self):
+        score, _ = self.score(["Javaによる開発経験"], ["JavaScript"])
+        self.assertEqual(score, 0)
+
+    def test_japanese_term_matches_talent_phase(self):
+        _, score, _ = _match_skills(
+            {"工程": ["要件定義", "基本設計"]}, ["要件定義の経験"], []
         )
-        self.assertGreaterEqual(score, 50)
+        self.assertEqual(score, 50)
 
 
 class PriceTest(unittest.TestCase):
