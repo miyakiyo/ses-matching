@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.matching_engine import (  # noqa: E402
     _normalize_price_man,
     _normalize_remote,
+    _match_skills,
     _normalize_skill,
     _parse_project_price_range,
     _parse_talent_price_range,
@@ -58,11 +59,64 @@ class RequiredTechTest(unittest.TestCase):
         score, _ = calculate_match_score({"希望単価": "70"}, project())
         self.assertGreater(score, 0)
 
-    def test_project_without_language_not_gated_by_db(self):
-        score, _ = calculate_match_score(
+    def test_project_without_language_uses_db_for_ratio(self):
+        score, reason = calculate_match_score(
             talent(), project(開発言語=None, データベース='["Oracle"]')
         )
+        self.assertEqual(excluded_rule(score, reason), "skills_below_half")
+
+
+class SkillScoreTest(unittest.TestCase):
+    def score(self, required, talent_langs, preferred=()):
+        _, score, details = _match_skills(
+            {"開発言語": talent_langs}, list(required), list(preferred)
+        )
+        return score, details
+
+    def test_all_required_is_50(self):
+        score, _ = self.score(["Java", "MySQL"], ["Java", "MySQL", "Go"])
+        self.assertEqual(score, 50)
+
+    def test_half_or_more_is_30(self):
+        score, _ = self.score(["Java", "MySQL"], ["Java"])
+        self.assertEqual(score, 30)
+
+    def test_less_than_half_is_0(self):
+        score, _ = self.score(["Java", "MySQL", "AWS"], ["Java"])
+        self.assertEqual(score, 0)
+
+    def test_no_required_is_0(self):
+        score, _ = self.score([], ["Java"])
+        self.assertEqual(score, 0)
+
+    def test_preferred_does_not_add_points(self):
+        score, details = self.score(["Java", "MySQL", "AWS"], ["Java", "Spring"], ["Spring"])
+        self.assertEqual(score, 0)
+        self.assertEqual(details["preferred_matches"], 1)
+
+    def test_below_half_is_excluded(self):
+        score, reason = calculate_match_score(
+            talent(),
+            project(開発言語='["Java"]', データベース='["MySQL", "Oracle"]'),
+        )
+        self.assertEqual(excluded_rule(score, reason), "skills_below_half")
+
+    def test_half_is_not_excluded(self):
+        score, _ = calculate_match_score(
+            talent(), project(開発言語='["Java"]', データベース='["MySQL"]')
+        )
         self.assertGreater(score, 0)
+
+    def test_project_without_tech_names_is_not_excluded(self):
+        score, _ = calculate_match_score(talent(), project(開発言語=None))
+        self.assertGreater(score, 0)
+
+    def test_required_skill_sentences_are_ignored(self):
+        score, _ = calculate_match_score(
+            talent(),
+            project(必須スキル='["AWSにおける設計構築・運用保守経験"]'),
+        )
+        self.assertGreaterEqual(score, 50)
 
 
 class PriceTest(unittest.TestCase):
