@@ -186,6 +186,7 @@ def _match_skills(
         "required_count": len(required),
         "preferred_matches": preferred_matches,
         "preferred_count": len(preferred),
+        "talent_skill_count": len(talent_all_skills),
     }
 
     return (required_ok, skill_score, details)
@@ -691,6 +692,10 @@ def calculate_match_score(talent_record: dict, project_record: dict) -> Tuple[in
         "score": skill_score,
         "details": skill_details,
     }
+    # 案件の技術名の半分未満しか人材が持っていない場合は除外する。
+    # 案件に技術名が無い、または人材のスキル情報が無い場合は判断できないので除外しない。
+    if skill_details["required_count"] > 0 and skill_details["talent_skill_count"] > 0 and not skill_match:
+        return _excluded_result({"rule": "skills_below_half", "detail": skill_details}, reason)
     
     # 2. 給与マッチング
     salary_match, salary_score, salary_details = _match_salary(

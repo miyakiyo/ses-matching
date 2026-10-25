@@ -59,11 +59,11 @@ class RequiredTechTest(unittest.TestCase):
         score, _ = calculate_match_score({"希望単価": "70"}, project())
         self.assertGreater(score, 0)
 
-    def test_project_without_language_not_gated_by_db(self):
-        score, _ = calculate_match_score(
+    def test_project_without_language_uses_db_for_ratio(self):
+        score, reason = calculate_match_score(
             talent(), project(開発言語=None, データベース='["Oracle"]')
         )
-        self.assertGreater(score, 0)
+        self.assertEqual(excluded_rule(score, reason), "skills_below_half")
 
 
 class SkillScoreTest(unittest.TestCase):
@@ -93,6 +93,23 @@ class SkillScoreTest(unittest.TestCase):
         score, details = self.score(["Java", "MySQL", "AWS"], ["Java", "Spring"], ["Spring"])
         self.assertEqual(score, 0)
         self.assertEqual(details["preferred_matches"], 1)
+
+    def test_below_half_is_excluded(self):
+        score, reason = calculate_match_score(
+            talent(),
+            project(開発言語='["Java"]', データベース='["MySQL", "Oracle"]'),
+        )
+        self.assertEqual(excluded_rule(score, reason), "skills_below_half")
+
+    def test_half_is_not_excluded(self):
+        score, _ = calculate_match_score(
+            talent(), project(開発言語='["Java"]', データベース='["MySQL"]')
+        )
+        self.assertGreater(score, 0)
+
+    def test_project_without_tech_names_is_not_excluded(self):
+        score, _ = calculate_match_score(talent(), project(開発言語=None))
+        self.assertGreater(score, 0)
 
     def test_required_skill_sentences_are_ignored(self):
         score, _ = calculate_match_score(
