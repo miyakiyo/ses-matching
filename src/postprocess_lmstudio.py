@@ -15,6 +15,7 @@ import requests
 import sqlite3
 
 from .database_utils import get_pending_records, update_record_json_status_and_properties
+from .extraction_normalizer import normalize_project_price_and_age, normalize_talent_price_and_age
 from .matching_engine import process_all_matches
 
 
@@ -1451,6 +1452,55 @@ def _ensure_lmstudio_model_reloaded(
         _LMSTUDIO_LAST_RELOAD_MONOTONIC = time.monotonic()
 
 
+_SIGNATURE_DELIMITER_PATTERN = re.compile(r"^\s*(?:--|[-=＝─━_＿*＊~〜・■□◆◇]{5,})\s*$")
+_SIGNATURE_CONTACT_PATTERN = re.compile(r"TEL|Tel|tel|電話|〒|E-?mail|Mail|mail|@|https?://|株式会社")
+# 署名の下に人材・案件の情報が続いていることがあるため、これらの語があれば削らない
+_SIGNATURE_INFO_PATTERN = re.compile(r"単価|単金|年齢|歳|才|精算|スキル|勤務地|最寄|稼働")
+
+
+def _strip_signature(body_text: str, max_signature_chars: int) -> str:
+    """本文末尾の署名を、区切り線を目印に取り除きます。
+
+    以前は末尾の固定文字数を削っていたが、単価・年齢の行まで削れることがあったため、
+    末尾 max_signature_chars 文字以内にある区切り線のうち、その下が連絡先だけのものを署名とみなす。
+    署名と判断できない場合は本文をそのまま返す（削りすぎるより安全なため）。
+
+    :param body_text: メール本文。
+    :param max_signature_chars: 署名とみなす末尾の最大文字数。0 以下なら何もしない。
+    :return: 署名を除いた本文。
+    """
+    if max_signature_chars <= 0:
+        return body_text
+
+    lines = body_text.splitlines(keepends=True)
+    tail_length = 0
+    for index in range(len(lines) - 1, -1, -1):
+        tail_length += len(lines[index])
+        if tail_length > max_signature_chars:
+            break
+        if not _SIGNATURE_DELIMITER_PATTERN.match(lines[index]):
+            continue
+        tail = "".join(lines[index + 1:])
+        if _SIGNATURE_CONTACT_PATTERN.search(tail) and not _SIGNATURE_INFO_PATTERN.search(tail):
+            return "".join(lines[:index])
+    return body_text
+
+
+def _build_response_format(schema_text: str, schema_name: str) -> dict[str, Any]:
+    """JSONスキーマを、出力をスキーマに強制させる response_format へ変換します。
+
+    プロンプトに貼るだけではモデルが選択肢や型を守らないことがあるため、
+    OpenAI 互換の json_schema 指定で生成そのものを制約する（LM Studio / vLLM / Ollama が対応）。
+    """
+    schema = json.loads(schema_text)
+    # "$schema" はメタ情報で、制約の生成には不要なため除く
+    schema.pop("$schema", None)
+    return {
+        "type": "json_schema",
+        "json_schema": {"name": schema_name, "strict": True, "schema": schema},
+    }
+
+
 def _call_lmstudio(
     endpoint: str,
     model: str,
@@ -1460,13 +1510,21 @@ def _call_lmstudio(
     max_tokens: int = 8192,
     signature_trim_chars: int = 300,
     greeting_trim_chars: int = 100,
+    subject_text: str = "",
 ) -> str:
-    """LM Studio に本文を送り、JSON文字列を返します。"""
+    """LM Studio に件名と本文を送り、JSON文字列を返します。
+
+    greeting_trim_chars は、先頭の固定文字数を削ると件名直後の単価・年齢が欠けるため使用しない
+    （呼び出し側との互換のため引数は残す）。
+    """
+    response_format: dict[str, Any] | None = None
     if category == "案件":
         case_schema_text = _load_case_schema_text()
+        response_format = _build_response_format(case_schema_text, "ses_project")
         system_content = (
-            "IT/SES営業メールの人材から情報をJSON抽出器\n"
-            "必ずJSONスキーマに従い未記載の項目は必ず null または [] にする\n"
+            "IT/SES営業メールの案件情報をJSONで抽出する\n"
+            "必ずJSONスキーマに従い、未記載の項目は必ず null または [] にする\n"
+            "単価・精算・年齢は計算や単位換算をせず、件名・本文の表記をそのまま書き写す\n"
             "日本語で作成する\n"
             "【重要】思考過程や挨拶、分析プロセスは一切不要\n"
             "以下のJSONスキーマに従う\n"
@@ -1475,14 +1533,16 @@ def _call_lmstudio(
         )
     elif category == "人材":
         human_schema_text = _load_human_schema_text()
+        response_format = _build_response_format(human_schema_text, "ses_talent")
         system_content = (
-            "IT/SES営業メールの人材から情報をJSON抽出器\n"
+            "IT/SES営業メールの人材情報をJSONで抽出する\n"
             "必ずJSONスキーマに従って出力してください。\n"
             "未記載の項目は必ず null または [] にする。\n"
+            "希望単価・年齢は計算や単位換算をせず、件名・本文の表記をそのまま書き写す。\n"
             "日本語で作成する。\n"
             "【重要】思考過程や挨拶、分析プロセスは一切不要\n"
             "以下のJSONスキーマに従う\n"
-            
+
             f"{human_schema_text}"
         )
     else:
@@ -1492,17 +1552,14 @@ def _call_lmstudio(
     body_text = _strip_problematic_unicode(body_text)
     # UTF-8 encode→decode で残留不正バイトを確実に除去（LM Studio parse 400 対策）
     body_text = body_text.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
-    # 挨拶除去：先頭 greeting_trim_chars 文字を削除する
-    if greeting_trim_chars > 0:
-        body_text = body_text[greeting_trim_chars:]
-    # 署名除去：末尾 signature_trim_chars 文字を削除する
-    if signature_trim_chars > 0 and len(body_text) > signature_trim_chars:
-        body_text = body_text[:-signature_trim_chars]
+    body_text = _strip_signature(body_text, signature_trim_chars)
+    subject_text = _strip_problematic_unicode(_sanitize_text_for_lm_request(subject_text))
     system_content = _sanitize_text_for_lm_request(system_content)
     system_content = _strip_problematic_unicode(system_content)
 
+    # 件名に単価・年齢・勤務形態が書かれることが多いため、本文と一緒に渡す
     prompt = (
-        f"本文:\n{body_text}"
+        f"件名:\n{subject_text}\n\n本文:\n{body_text}"
     )
 
     request_variants: list[tuple[str, str]] = []
@@ -1524,11 +1581,13 @@ def _call_lmstudio(
                 {"role": "system", "content": system_variant},
                 {"role": "user", "content": prompt_variant},
             ],
-            # "temperature": 0.3,
+            # 抽出作業で表記ゆれを出さないよう、毎回同じ出力になる設定にする
+            "temperature": 0,
             # "presence_penalty": 0.1,
             "max_tokens": max_tokens,
-            # "response_format": { "type": "json_object" }
         }
+        if response_format is not None:
+            payload["response_format"] = response_format
 
         resp = requests.post(endpoint, json=payload, timeout=timeout)
         if resp.ok:
@@ -1657,6 +1716,7 @@ def _process_single_record_for_lm(
     process_start_command: str = "",
     process_startup_wait_seconds: int = 30,
     provider: str = "lmstudio",
+    subject_text: str = "",
 ) -> tuple[str, dict[str, Any]]:
     """単一レコードのLM問い合わせ結果を返す（DB更新は行わない）。"""
     if provider == "lmstudio":
@@ -1684,6 +1744,7 @@ def _process_single_record_for_lm(
                 max_tokens=attempt_max_tokens,
                 signature_trim_chars=signature_trim_chars,
                 greeting_trim_chars=greeting_trim_chars,
+                subject_text=subject_text,
             )
             break
         except RuntimeError as e:
@@ -1815,6 +1876,7 @@ def process_pending_records_with_lmstudio(
                         process_start_command=process_start_command,
                         process_startup_wait_seconds=process_startup_wait_seconds,
                         provider=provider,
+                        subject_text=subject_text,
                     )
                     batch_futures[future] = (record_id, subject_text, body_text)
                     futures[future] = record_id
@@ -1832,6 +1894,12 @@ def process_pending_records_with_lmstudio(
                             table_name=table_name,
                             record_id=record_id,
                         )
+                        # 単価・年齢は原文で抽出させているため、列へ保存する数値はここで求める。
+                        # json_data には LLM が書き写した原文を残す。
+                        if category == "案件":
+                            first_obj = normalize_project_price_and_age(first_obj)
+                        else:
+                            first_obj = normalize_talent_price_and_age(first_obj)
                         logger.debug(
                             "LM save payload: table=%s, id=%s, chars=%s, json=%s",
                             table_name,
@@ -1840,7 +1908,20 @@ def process_pending_records_with_lmstudio(
                             _truncate_for_log(json_text),
                         )
                         save_status = "1"
-                        if table_name == "mails_project":
+                        # 件名による振り分けと、LLM が本文から判定した分類が逆の場合は、
+                        # 振り分け誤り（人材メールが案件に入る等）とみなしてマッチング対象外にする。
+                        # 「その他」は判定があいまいなため対象外にしない。
+                        llm_category = str(first_obj.get("分類") or "").strip()
+                        opposite_category = "人材" if category == "案件" else "案件"
+                        if llm_category == opposite_category:
+                            save_status = "5"
+                            logger.info(
+                                "LM分類が件名の振り分けと逆のため status=5 を付与: table=%s, id=%s, llm_category=%s",
+                                table_name,
+                                record_id,
+                                llm_category,
+                            )
+                        elif table_name == "mails_project":
                             matched_keyword = _find_first_matched_keyword(
                                 subject=subject_text,
                                 body=body_text,

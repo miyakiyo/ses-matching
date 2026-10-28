@@ -111,12 +111,18 @@ class SkillScoreTest(unittest.TestCase):
         score, _ = calculate_match_score(talent(), project(開発言語=None))
         self.assertGreater(score, 0)
 
-    def test_score_is_capped_at_99_unless_all_required_found(self):
-        base = {"単価下限": 60, "単価上限": 80, "担当": '["SE"]', "工程": '["開発"]'}
-        t = {"開発言語": '["Java"]', "希望単価": "70", "担当": '["SE"]', "工程": '["開発"]'}
+    def test_score_is_below_100_unless_all_required_found(self):
+        base = {
+            "単価下限": 60, "単価上限": 80, "担当": '["SE"]', "工程": '["開発"]',
+            "年齢下限": 20, "年齢上限": 45, "リモート頻度": "週2出社",
+        }
+        t = {
+            "開発言語": '["Java"]', "希望単価": "70", "担当": '["SE"]', "工程": '["開発"]',
+            "年齢": "30", "リモート頻度": "週3出社",
+        }
         half, _ = calculate_match_score(t, {**base, "開発言語": '["Java", "Go"]'})
         full, _ = calculate_match_score(t, {**base, "開発言語": '["Java"]'})
-        self.assertEqual(half, 99)
+        self.assertLess(half, 100)
         self.assertEqual(full, 100)
 
     def test_required_skill_sentence_matches_by_word(self):
@@ -231,6 +237,123 @@ class RemoteTest(unittest.TestCase):
         score, _ = calculate_match_score(
             talent(リモート頻度="出社可"), project(リモート頻度="基本出社")
         )
+        self.assertGreater(score, 0)
+
+    def test_negation_is_onsite(self):
+        for value in ("リモート不可", "在宅不可", "リモートなし", "テレワーク不可"):
+            self.assertEqual(_normalize_remote(value), "onsite", value)
+
+    def test_full_remote_with_exceptional_onsite(self):
+        # 初日・緊急時・月1回・MTGのときだけの出社は、フルリモート希望として扱う
+        for value in (
+            "フルリモート必須（初日、緊急時出社可）",
+            "フルリモート(初日出社可能)",
+            "フルリモート（初日、月1出社可能）",
+            "基本リモート（MTGのみ出社）",
+            "フルリモ希望",
+        ):
+            self.assertEqual(_normalize_remote(value), "full_remote", value)
+
+    def test_full_remote_with_weekly_office_is_hybrid(self):
+        self.assertEqual(_normalize_remote("フルリモート/週2出社"), "hybrid")
+        self.assertEqual(_normalize_remote("リモート希望（併用出社可能）"), "hybrid")
+
+    def test_full_remote_talent_weekly_office_project_excluded(self):
+        score, reason = calculate_match_score(
+            talent(リモート頻度="フルリモート希望"), project(リモート頻度="週2出社")
+        )
+        self.assertEqual(excluded_rule(score, reason), "remote_mismatch")
+
+    def test_full_remote_talent_full_remote_project_passes(self):
+        score, reason = calculate_match_score(
+            talent(リモート頻度="フルリモート"), project(リモート頻度="フルリモート")
+        )
+        self.assertGreater(score, 0)
+        self.assertEqual(reason["remote"]["score"], 15)
+
+    def test_more_office_days_than_talent_accepts_is_mismatch(self):
+        score, reason = calculate_match_score(
+            talent(リモート頻度="週2出社"), project(リモート頻度="週3出社")
+        )
+        self.assertGreater(score, 0)
+        self.assertFalse(reason["remote"]["match"])
+        self.assertEqual(reason["remote"]["score"], 0)
+        # 画面表示用にリモート頻度の原文を残す
+        self.assertEqual(reason["remote"]["details"]["talent_value"], "週2出社")
+        self.assertEqual(reason["remote"]["details"]["project_value"], "週3出社")
+
+    def test_hybrid_talent_onsite_project_is_mismatch(self):
+        _, reason = calculate_match_score(
+            talent(リモート頻度="リモート併用希望"), project(リモート頻度="出社")
+        )
+        self.assertFalse(reason["remote"]["match"])
+
+    def test_unknown_remote_is_not_mismatch(self):
+        _, reason = calculate_match_score(
+            talent(リモート頻度="不明"), project(リモート頻度="出社")
+        )
+        self.assertTrue(reason["remote"]["match"])
+        self.assertEqual(reason["remote"]["details"]["status"], "unknown")
+
+
+def full_match_pair(**talent_overrides):
+    """すべての項目が一致する人材・案件の組み合わせを作ります。"""
+    t = {
+        "開発言語": '["Java"]', "希望単価": "70", "担当": '["SE"]', "工程": '["開発"]',
+        "年齢": "30", "リモート頻度": "週3出社",
+    }
+    t.update(talent_overrides)
+    p = {
+        "開発言語": '["Java"]', "単価下限": 60, "単価上限": 80, "担当": '["SE"]', "工程": '["開発"]',
+        "年齢下限": 20, "年齢上限": 45, "リモート頻度": "週2出社",
+    }
+    return t, p
+
+
+class TotalScoreTest(unittest.TestCase):
+    def test_all_items_matched_is_100(self):
+        score, _ = calculate_match_score(*full_match_pair())
+        self.assertEqual(score, 100)
+
+    def test_unknown_price_is_not_100(self):
+        score, _ = calculate_match_score(*full_match_pair(希望単価=None))
+        self.assertLess(score, 100)
+
+    def test_price_not_overlapping_is_not_100(self):
+        # 人材の希望が案件の下限より安い（範囲が重ならない）場合も 100 点にしない
+        score, reason = calculate_match_score(*full_match_pair(希望単価="40"))
+        self.assertFalse(reason["salary"]["match"])
+        self.assertLess(score, 100)
+
+    def test_unknown_remote_is_not_100(self):
+        score, _ = calculate_match_score(*full_match_pair(リモート頻度=None))
+        self.assertLess(score, 100)
+
+    def test_unknown_age_is_not_100(self):
+        score, _ = calculate_match_score(*full_match_pair(年齢=None))
+        self.assertLess(score, 100)
+
+    def test_score_is_converted_from_150(self):
+        # 単価だけ不明: 150 点満点中 125 点 → 83 点
+        score, _ = calculate_match_score(*full_match_pair(希望単価=None))
+        self.assertEqual(score, 83)
+
+
+class ConstraintTest(unittest.TestCase):
+    def test_foreign_talent_on_domestic_only_project_excluded(self):
+        score, reason = calculate_match_score(
+            talent(外国籍="true"), project(外国籍可否="false")
+        )
+        self.assertEqual(excluded_rule(score, reason), "constraints_mismatch")
+
+    def test_freelance_talent_on_freelance_ng_project_excluded(self):
+        score, reason = calculate_match_score(
+            talent(個人事業主="true"), project(個人事業主可否="false")
+        )
+        self.assertEqual(excluded_rule(score, reason), "constraints_mismatch")
+
+    def test_unknown_constraints_pass(self):
+        score, _ = calculate_match_score(talent(外国籍=None), project(外国籍可否="false"))
         self.assertGreater(score, 0)
 
 

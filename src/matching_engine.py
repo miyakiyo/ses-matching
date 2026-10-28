@@ -34,6 +34,9 @@ SKILL_SCORE_ALL = 50
 SKILL_SCORE_HALF = 30
 # 必須スキルが全部揃っていないペアの総合点の上限
 MAX_SCORE_WITHOUT_ALL_SKILLS = 99
+# 各項目の満点の合計（スキル50・単価25・担当10・工程10・立場制約25・年齢15・勤務形態15）。
+# 項目ごとの満点はアプリの表示が前提にしているため変えず、総合点はこの合計を100点に換算する。
+RAW_SCORE_MAX = 150
 
 DEFAULT_MATCHING_CHUNK_SIZE = 50
 DEFAULT_TALENT_LOG_INTERVAL = 100
@@ -580,10 +583,38 @@ REMOTE_ONSITE = "onsite"
 REMOTE_UNKNOWN = "unknown"
 
 _REMOTE_UNKNOWN_TOKENS = {"", "[]", "不明", "未記載", "記載なし", "なし", "none", "null", "-", "－"}
-_REMOTE_HYBRID_PATTERN = re.compile(r"週\s*\d\s*(?:日)?\s*(?:程度)?\s*(?:の)?\s*出社|一部|ハイブリッド|併用|月\s*\d\s*回")
-_REMOTE_FULL_PATTERN = re.compile(r"フルリモート|完全リモート|全日リモート|リモート\s*100|100\s*%\s*リモート|完全在宅|フル在宅|リモートのみ|リモート希望|在宅のみ|基本リモート|リモート中心")
+# 「リモート不可」「在宅なし」は出社。リモートの語を含むため、他の判定より先に見る
+_REMOTE_NEGATION_PATTERN = re.compile(r"(?:リモート|在宅|テレワーク)(?:ワーク)?\s*(?:不可|なし|無し|ng|できません)")
+_REMOTE_WEEKLY_OFFICE_PATTERN = re.compile(r"週\s*(\d)\s*(?:日)?\s*(?:程度|以上|以下|ほど)?\s*(?:の)?\s*(?:出社|出勤)")
+_REMOTE_HYBRID_PATTERN = re.compile(r"一部|ハイブリッド|併用|月\s*\d\s*回")
+_REMOTE_FULL_PATTERN = re.compile(
+    r"フルリモ|完全リモート|全日リモート|リモート\s*100|100\s*%\s*リモート|完全在宅|フル在宅|リモートのみ|リモート希望"
+    r"|リモート必須|原則リモート|原則在宅|在宅希望|在宅のみ|基本リモート|リモート中心"
+)
+# 「初日・緊急時・月1回なら出社可」のような例外的な出社。フルリモートの判定を妨げないよう除いてから見る
+_REMOTE_EXCEPTIONAL_ONSITE_PATTERN = re.compile(
+    r"(?:初日|初回|緊急時?|必要に応じて?|mtg|会議|打ち合わせ|研修|入場|キックオフ|月\s*\d\s*回?|年\s*\d\s*回?|たまに|稀に|まれに)"
+    r"[^、。/()]*?(?:出社|出勤|訪問)[^、。/()]*"
+)
 _REMOTE_ONSITE_PATTERN = re.compile(r"出社|常駐|オンサイト|客先|現地")
 _REMOTE_ANY_PATTERN = re.compile(r"リモート|在宅|テレワーク")
+
+# 週あたりの出社日数。日数の書かれていない「一部リモート」は、人材側は週4日まで出社できる、
+# 案件側は週1日以上の出社が必要、とみなす（どちらも一致しやすい側に倒す）。
+OFFICE_DAYS_FULL_REMOTE = 0
+OFFICE_DAYS_ONSITE = 5
+OFFICE_DAYS_TALENT_HYBRID = 4
+OFFICE_DAYS_PROJECT_HYBRID = 1
+REMOTE_SCORE = 15
+
+
+def _normalize_remote_text(value) -> str:
+    """リモート頻度の値を、判定用の小文字の文字列にします。"""
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        value = " ".join(str(v) for v in value)
+    return unicodedata.normalize("NFKC", str(value)).strip().lower()
 
 
 def _normalize_remote(value) -> str:
@@ -591,27 +622,27 @@ def _normalize_remote(value) -> str:
 
     判断できない場合は unknown とし、除外には使わない。
     """
-    if value is None:
-        return REMOTE_UNKNOWN
-    if isinstance(value, (list, tuple)):
-        value = " ".join(str(v) for v in value)
-
-    text = unicodedata.normalize("NFKC", str(value)).strip().lower()
+    text = _normalize_remote_text(value)
     if text in _REMOTE_UNKNOWN_TOKENS:
         return REMOTE_UNKNOWN
     # プロンプトの例文（「例: フルリモート/週2出社 など」）がそのまま抽出されたもの
     if "例:" in text or ("など" in text and "/" in text):
         return REMOTE_UNKNOWN
 
+    if _REMOTE_NEGATION_PATTERN.search(text):
+        return REMOTE_ONSITE
+    if _REMOTE_WEEKLY_OFFICE_PATTERN.search(text):
+        return REMOTE_HYBRID
+
+    if _REMOTE_FULL_PATTERN.search(text):
+        # 「フルリモート（出社も可）」のように、例外以外の出社にも触れている場合は断定しない
+        rest = _REMOTE_EXCEPTIONAL_ONSITE_PATTERN.sub("", text)
+        return REMOTE_HYBRID if _REMOTE_ONSITE_PATTERN.search(rest) else REMOTE_FULL
     if _REMOTE_HYBRID_PATTERN.search(text):
         return REMOTE_HYBRID
 
     has_onsite = bool(_REMOTE_ONSITE_PATTERN.search(text))
     has_remote = bool(_REMOTE_ANY_PATTERN.search(text))
-
-    if _REMOTE_FULL_PATTERN.search(text):
-        # 「フルリモート（出社も可）」のように出社にも触れている場合は断定しない
-        return REMOTE_HYBRID if has_onsite else REMOTE_FULL
     if has_onsite and has_remote:
         return REMOTE_HYBRID
     if has_onsite:
@@ -621,16 +652,74 @@ def _normalize_remote(value) -> str:
     return REMOTE_UNKNOWN
 
 
+def _office_days(value, hybrid_days: int) -> Optional[int]:
+    """リモート頻度から、週あたりの出社日数を求めます。判断できない場合は None。
+
+    :param value: リモート頻度の値。
+    :param hybrid_days: 日数の書かれていない「一部リモート」のときに使う日数。
+    :return: 週あたりの出社日数（0〜5）。
+    """
+    category = _normalize_remote(value)
+    if category == REMOTE_UNKNOWN:
+        return None
+    if category == REMOTE_FULL:
+        return OFFICE_DAYS_FULL_REMOTE
+    if category == REMOTE_ONSITE:
+        return OFFICE_DAYS_ONSITE
+    weekly = _REMOTE_WEEKLY_OFFICE_PATTERN.search(_normalize_remote_text(value))
+    if weekly:
+        return min(OFFICE_DAYS_ONSITE, int(weekly.group(1)))
+    return hybrid_days
+
+
+def _remote_display_value(value) -> Optional[str]:
+    """リモート頻度を、判定理由に残す表示用の文字列にします。無ければ None。"""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        value = " ".join(str(v) for v in value)
+    text = str(value).strip()
+    if not text:
+        return None
+    return text
+
+
 def _check_remote_exclusion(talent_record: dict, project_record: dict) -> Optional[dict]:
-    """人材がフルリモート希望、かつ案件が出社前提の場合に除外理由を返します。"""
+    """人材がフルリモート希望で、案件が出社（週1日以上を含む）の場合に除外理由を返します。"""
     talent_remote = _normalize_remote(talent_record.get("リモート頻度"))
     project_remote = _normalize_remote(project_record.get("リモート頻度"))
-    if talent_remote == REMOTE_FULL and project_remote == REMOTE_ONSITE:
+    if talent_remote == REMOTE_FULL and project_remote in (REMOTE_ONSITE, REMOTE_HYBRID):
         return {
             "rule": "remote_mismatch",
             "detail": {"talent": talent_remote, "project": project_remote},
         }
     return None
+
+
+def _match_remote(talent_record: dict, project_record: dict) -> Tuple[bool, int, dict]:
+    """勤務形態のマッチング判定を実施します（ソフト制約）。
+
+    案件が求める週の出社日数が、人材の出社できる日数以内なら一致。
+    どちらかが不明な場合は判定せず 0 点とする（不一致には含めない）。
+    """
+    talent_remote = talent_record.get("リモート頻度")
+    project_remote = project_record.get("リモート頻度")
+    talent_days = _office_days(talent_remote, OFFICE_DAYS_TALENT_HYBRID)
+    project_days = _office_days(project_remote, OFFICE_DAYS_PROJECT_HYBRID)
+    # 日数は「一部リモート」を仮の日数で置いた値を含むため、画面表示用に原文も残す
+    details: dict = {
+        "talent_office_days": talent_days,
+        "project_office_days": project_days,
+        "talent_value": _remote_display_value(talent_remote),
+        "project_value": _remote_display_value(project_remote),
+    }
+    if talent_days is None or project_days is None:
+        details["status"] = "unknown"
+        return (True, 0, details)
+
+    match = project_days <= talent_days
+    details["status"] = "matched" if match else "not_matched"
+    return (match, REMOTE_SCORE if match else 0, details)
 
 
 # 足切りは開発言語のみ。DB・OS/クラウドは人材側の記載が疎で、正しいペアを落とす率が高い（実データで確認）。
@@ -691,8 +780,8 @@ def _excluded_result(rule: dict, reason: dict) -> Tuple[int, dict]:
 def calculate_match_score(talent_record: dict, project_record: dict) -> Tuple[int, dict]:
     """人材と案件のマッチングスコアを計算します。
 
-    除外条件（必須技術名の不一致・単価逆転・年齢範囲外・リモート不一致）に該当する場合は
-    スコア 0 を返し、reason["excluded"] に理由を入れます。
+    除外条件（必須技術名の不一致・単価逆転・年齢範囲外・リモート不一致・立場制約の違反）に
+    該当する場合はスコア 0 を返し、reason["excluded"] に理由を入れます。
 
     :param talent_record: 人材レコード辞書。
     :param project_record: 案件レコード辞書。
@@ -777,7 +866,19 @@ def calculate_match_score(talent_record: dict, project_record: dict) -> Tuple[in
         "score": constraint_score,
         "details": constraint_details,
     }
-    
+    # 外国籍不可・個人事業主不可・貴社所属まで・派遣の1社下は、提案できないため除外する。
+    if not constraint_match:
+        return _excluded_result({"rule": "constraints_mismatch", "detail": constraint_details}, reason)
+
+    # 4.5 勤務形態（リモート頻度）
+    remote_match, remote_score, remote_details = _match_remote(talent_record, project_record)
+    total_score += remote_score
+    reason["remote"] = {
+        "match": remote_match,
+        "score": remote_score,
+        "details": remote_details,
+    }
+
     # 5. 年齢
     age_match, age_score, age_details = _match_age(
         talent_record,
@@ -801,11 +902,16 @@ def calculate_match_score(talent_record: dict, project_record: dict) -> Tuple[in
     ):
         return _excluded_result({"rule": "age_out_of_range", "detail": age_details}, reason)
 
-    # スコアを 0-100 に正規化（最大 100 を超えないように）
+    # 各項目の満点の合計（RAW_SCORE_MAX）を 100 点に換算する。
+    # 以前は合計 135 点を 100 点で頭打ちにしていたため、単価が不明・不一致でも 100 点になっていた。
+    # 不明な項目は 0 点のため、すべての項目が一致した場合だけ 100 点になる。
+    total_score = round(total_score * 100 / RAW_SCORE_MAX)
     # 必須スキルが全部揃っていない（スキル 50 点でない）場合は、100 点にしない。
     max_score = 100 if skill_score >= SKILL_SCORE_ALL else MAX_SCORE_WITHOUT_ALL_SKILLS
     total_score = min(max_score, total_score)
-    
+    # 除外されていないペアが 0 点にならないよう 1 点を下限にする（0 点は除外の意味で使っているため）
+    total_score = max(1, total_score)
+
     return (total_score, reason)
 
 
