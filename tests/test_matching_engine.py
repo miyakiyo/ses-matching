@@ -333,6 +333,20 @@ class TotalScoreTest(unittest.TestCase):
         score, _ = calculate_match_score(*full_match_pair(年齢=None))
         self.assertLess(score, 100)
 
+    def test_project_without_age_limit_is_100(self):
+        # 案件に年齢制限が無いのは「不明」ではなく「条件なし」のため、年齢は満点
+        talent_record, project_record = full_match_pair()
+        project_record.update(年齢下限=None, 年齢上限=None)
+        score, reason = calculate_match_score(talent_record, project_record)
+        self.assertEqual(score, 100)
+        self.assertEqual(reason["age"]["details"]["status"], "no_limit")
+
+    def test_project_without_age_limit_and_unknown_talent_age_is_full(self):
+        talent_record, project_record = full_match_pair(年齢=None)
+        project_record.update(年齢下限=None, 年齢上限=None)
+        _, reason = calculate_match_score(talent_record, project_record)
+        self.assertEqual(reason["age"]["score"], 15)
+
     def test_score_is_converted_from_150(self):
         # 単価だけ不明: 150 点満点中 125 点 → 83 点
         score, _ = calculate_match_score(*full_match_pair(希望単価=None))

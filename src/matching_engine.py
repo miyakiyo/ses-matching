@@ -552,11 +552,22 @@ def _match_age(talent_record: dict, project_record: dict) -> Tuple[bool, int, di
     ):
         return (True, 0, {'status': 'invalid_project_age_range'})
 
-    # 制限なしまたは人材の年齢不明の場合はデータなしとしてスキップ
-    if (
-        (talent_age_min is None and talent_age_max is None)
-        or (project_age_min is None and project_age_max is None)
-    ):
+    # 案件に年齢制限が無い場合は、どの年齢でも条件を満たすため満点とする。
+    # 以前は「不明」として 0 点にしていたため、案件の約半数で 100 点にならなかった。
+    if project_age_min is None and project_age_max is None:
+        return (
+            True,
+            15,
+            {
+                'status': 'no_limit',
+                'talent_age_min': talent_age_min,
+                'talent_age_max': talent_age_max,
+                'within_limit': True,
+            },
+        )
+
+    # 案件に年齢制限があり、人材の年齢が不明な場合は判定できないため 0 点とする
+    if talent_age_min is None and talent_age_max is None:
         return (True, 0, {'status': 'unknown_age'})
 
     # 人材年齢レンジと案件制約レンジの重なりで判定する。
