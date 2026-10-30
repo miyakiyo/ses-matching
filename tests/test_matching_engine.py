@@ -115,10 +115,11 @@ class SkillScoreTest(unittest.TestCase):
         base = {
             "単価下限": 60, "単価上限": 80, "担当": '["SE"]', "工程": '["開発"]',
             "年齢下限": 20, "年齢上限": 45, "リモート頻度": "週2出社",
+            "時期": "11月～", "received_at": RECEIVED_AT,
         }
         t = {
             "開発言語": '["Java"]', "希望単価": "70", "担当": '["SE"]', "工程": '["開発"]',
-            "年齢": "30", "リモート頻度": "週3出社",
+            "年齢": "30", "リモート頻度": "週3出社", "稼働可能日": "11月～", "received_at": RECEIVED_AT,
         }
         half, _ = calculate_match_score(t, {**base, "開発言語": '["Java", "Go"]'})
         full, _ = calculate_match_score(t, {**base, "開発言語": '["Java"]'})
@@ -296,16 +297,19 @@ class RemoteTest(unittest.TestCase):
         self.assertEqual(reason["remote"]["details"]["status"], "unknown")
 
 
+RECEIVED_AT = "2026-10-28T00:00:00Z"
+
+
 def full_match_pair(**talent_overrides):
     """すべての項目が一致する人材・案件の組み合わせを作ります。"""
     t = {
         "開発言語": '["Java"]', "希望単価": "70", "担当": '["SE"]', "工程": '["開発"]',
-        "年齢": "30", "リモート頻度": "週3出社",
+        "年齢": "30", "リモート頻度": "週3出社", "稼働可能日": "11月～", "received_at": RECEIVED_AT,
     }
     t.update(talent_overrides)
     p = {
         "開発言語": '["Java"]', "単価下限": 60, "単価上限": 80, "担当": '["SE"]', "工程": '["開発"]',
-        "年齢下限": 20, "年齢上限": 45, "リモート頻度": "週2出社",
+        "年齢下限": 20, "年齢上限": 45, "リモート頻度": "週2出社", "時期": "11月～", "received_at": RECEIVED_AT,
     }
     return t, p
 
@@ -347,10 +351,54 @@ class TotalScoreTest(unittest.TestCase):
         _, reason = calculate_match_score(talent_record, project_record)
         self.assertEqual(reason["age"]["score"], 15)
 
-    def test_score_is_converted_from_150(self):
-        # 単価だけ不明: 150 点満点中 125 点 → 83 点
+    def test_score_is_converted_from_180(self):
+        # 単価だけ不明: 180 点満点中 155 点 → 86 点
         score, _ = calculate_match_score(*full_match_pair(希望単価=None))
-        self.assertEqual(score, 83)
+        self.assertEqual(score, 86)
+
+    def test_talent_outside_kanto_is_not_100(self):
+        # 改善案 #291172: 愛知の人材と東京の案件
+        talent_record, project_record = full_match_pair(
+            subject="【11月／愛知】常駐可能｜Java（東刈谷駅）", 最寄駅="野田新町駅"
+        )
+        project_record["作業場所"] = "飯田橋 or 水道橋"
+        score, reason = calculate_match_score(talent_record, project_record)
+        self.assertLess(score, 100)
+        self.assertEqual(reason["location"]["details"]["status"], "not_matched")
+        self.assertEqual(reason["location"]["score"], 0)
+
+    def test_project_outside_kanto_is_not_100(self):
+        talent_record, project_record = full_match_pair(最寄駅="横浜駅")
+        project_record["作業場所"] = "大阪・本町"
+        _, reason = calculate_match_score(talent_record, project_record)
+        self.assertFalse(reason["location"]["match"])
+
+    def test_station_only_is_assumed_kanto(self):
+        talent_record, project_record = full_match_pair(最寄駅="溝の口")
+        project_record["作業場所"] = "茅場町"
+        score, reason = calculate_match_score(talent_record, project_record)
+        self.assertEqual(score, 100)
+        self.assertEqual(reason["location"]["details"]["status"], "matched")
+
+    def test_full_remote_project_ignores_talent_location(self):
+        talent_record, project_record = full_match_pair(最寄駅="天神駅", リモート頻度="フルリモート")
+        project_record["リモート頻度"] = "フルリモート"
+        _, reason = calculate_match_score(talent_record, project_record)
+        self.assertEqual(reason["location"]["details"]["status"], "remote")
+        self.assertEqual(reason["location"]["score"], 15)
+
+    def test_different_start_month_is_not_100(self):
+        # 案件は12月開始、人材は11月から稼働（改善案 #75289）
+        talent_record, project_record = full_match_pair()
+        project_record["時期"] = "2026年12月～2027年1月"
+        score, reason = calculate_match_score(talent_record, project_record)
+        self.assertLess(score, 100)
+        self.assertEqual(reason["start"]["details"]["status"], "not_matched")
+
+    def test_unknown_start_is_not_100(self):
+        score, reason = calculate_match_score(*full_match_pair(稼働可能日=None))
+        self.assertLess(score, 100)
+        self.assertEqual(reason["start"]["details"]["status"], "unknown")
 
 
 class ConstraintTest(unittest.TestCase):

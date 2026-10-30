@@ -14,6 +14,8 @@ from .database_utils import (
     delete_matches_not_in_pairs,
     delete_low_score_matches,
 )
+from .extraction_grounding import PROJECT_TECH_FIELDS, TALENT_TECH_FIELDS, ground_record
+from .extraction_normalizer import REGION_OTHER, classify_region, parse_start_months
 
 
 logger = logging.getLogger(__name__)
@@ -34,9 +36,11 @@ SKILL_SCORE_ALL = 50
 SKILL_SCORE_HALF = 30
 # 必須スキルが全部揃っていないペアの総合点の上限
 MAX_SCORE_WITHOUT_ALL_SKILLS = 99
-# 各項目の満点の合計（スキル50・単価25・担当10・工程10・立場制約25・年齢15・勤務形態15）。
+# 各項目の満点の合計（スキル50・単価25・担当10・工程10・立場制約25・年齢15・勤務形態15・開始時期15・勤務地15）。
 # 項目ごとの満点はアプリの表示が前提にしているため変えず、総合点はこの合計を100点に換算する。
-RAW_SCORE_MAX = 150
+RAW_SCORE_MAX = 180
+START_SCORE = 15
+LOCATION_SCORE = 15
 
 DEFAULT_MATCHING_CHUNK_SIZE = 50
 DEFAULT_TALENT_LOG_INTERVAL = 100
@@ -733,6 +737,59 @@ def _match_remote(talent_record: dict, project_record: dict) -> Tuple[bool, int,
     return (match, REMOTE_SCORE if match else 0, details)
 
 
+def _match_start(talent_record: dict, project_record: dict) -> Tuple[bool, int, dict]:
+    """開始時期のマッチング判定を実施します（ソフト制約）。
+
+    案件の開始月と人材の稼働可能月が同じなら一致。営業の判断では、人材が11月から稼働できても
+    12月開始の案件には提案しにくいため、月が違えば不一致とする（除外まではしない）。
+    どちらかが読み取れない場合は判定せず 0 点とする（不一致には含めない）。
+    """
+    talent_value = _remote_display_value(talent_record.get("稼働可能日"))
+    project_value = _remote_display_value(project_record.get("時期"))
+    talent_months = parse_start_months(talent_value, talent_record.get("received_at"))
+    project_months = parse_start_months(project_value, project_record.get("received_at"))
+    details: dict = {
+        "talent_months": talent_months,
+        "project_months": project_months,
+        "talent_value": talent_value,
+        "project_value": project_value,
+    }
+    if not talent_months or not project_months:
+        details["status"] = "unknown"
+        return (True, 0, details)
+
+    match = bool(set(talent_months) & set(project_months))
+    details["status"] = "matched" if match else "not_matched"
+    return (match, START_SCORE if match else 0, details)
+
+
+def _match_location(talent_record: dict, project_record: dict) -> Tuple[bool, int, dict]:
+    """勤務地のマッチング判定を実施します（ソフト制約）。
+
+    取引の対象は関東のため、人材の最寄駅・案件の作業場所のどちらかが関東以外なら 0 点とする。
+    案件がフルリモートなら、人材の場所は問わない。
+    地名から判断できない場合は関東とみなす（最寄駅・作業場所は駅名だけの記載が大半で、
+    関東の駅をすべて列挙できないため。関東以外の地名は件名にも書かれることが多い）。
+    """
+    talent_value = _remote_display_value(talent_record.get("最寄駅"))
+    project_value = _remote_display_value(project_record.get("作業場所"))
+    talent_region = classify_region(talent_value, talent_record.get("subject"))
+    project_region = classify_region(project_value, project_record.get("subject"))
+    details: dict = {
+        "talent_region": talent_region,
+        "project_region": project_region,
+        "talent_value": talent_value,
+        "project_value": project_value,
+    }
+    if _normalize_remote(project_record.get("リモート頻度")) == REMOTE_FULL:
+        details["status"] = "remote"
+        return (True, LOCATION_SCORE, details)
+
+    match = talent_region != REGION_OTHER and project_region != REGION_OTHER
+    details["status"] = "matched" if match else "not_matched"
+    return (match, LOCATION_SCORE if match else 0, details)
+
+
 # 足切りは開発言語のみ。DB・OS/クラウドは人材側の記載が疎で、正しいペアを落とす率が高い（実データで確認）。
 _TECH_GATE_KEYS = ("開発言語",)
 _TALENT_SKILL_KEYS = ("開発言語", "OS/クラウド", "データベース", "スキル", "資格")
@@ -890,6 +947,24 @@ def calculate_match_score(talent_record: dict, project_record: dict) -> Tuple[in
         "details": remote_details,
     }
 
+    # 4.6 開始時期
+    start_match, start_score, start_details = _match_start(talent_record, project_record)
+    total_score += start_score
+    reason["start"] = {
+        "match": start_match,
+        "score": start_score,
+        "details": start_details,
+    }
+
+    # 4.7 勤務地
+    location_match, location_score, location_details = _match_location(talent_record, project_record)
+    total_score += location_score
+    reason["location"] = {
+        "match": location_match,
+        "score": location_score,
+        "details": location_details,
+    }
+
     # 5. 年齢
     age_match, age_score, age_details = _match_age(
         talent_record,
@@ -951,13 +1026,23 @@ def _load_project_records(
     conn: sqlite3.Connection,
     project_ids: list[int],
 ) -> list[tuple[int, dict]]:
-    """案件レコードを一度だけ読み込み、評価用に保持します。"""
+    """案件レコードを一度だけ読み込み、評価用に保持します（件名・本文に根拠の無い抽出値は除く）。"""
     project_records: list[tuple[int, dict]] = []
     for project_id in sorted(project_ids):
         project_record = get_project_record(conn, project_id)
         if project_record:
-            project_records.append((project_id, project_record))
+            project_records.append(
+                (project_id, ground_record(project_record, PROJECT_TECH_FIELDS, _load_skill_aliases()))
+            )
     return project_records
+
+
+def _load_talent_record(conn: sqlite3.Connection, talent_id: int) -> dict:
+    """人材レコードを読み込みます（件名・本文に根拠の無い抽出値は除く）。見つからなければ空の辞書。"""
+    talent_record = get_talent_record(conn, talent_id)
+    if not talent_record:
+        return {}
+    return ground_record(talent_record, TALENT_TECH_FIELDS, _load_skill_aliases())
 
 
 def _get_talent_subject(talent_record: dict) -> str:
@@ -1033,7 +1118,7 @@ def _compute_matches_sequential(
     normalized_log_interval = max(1, int(talent_log_interval or DEFAULT_TALENT_LOG_INTERVAL))
 
     for talent_id in sorted(talent_ids):
-        talent_record = get_talent_record(conn, talent_id)
+        talent_record = _load_talent_record(conn, talent_id)
         if not talent_record:
             continue
 
@@ -1083,7 +1168,7 @@ def _compute_matches_worker(
         completed_talents: list[tuple[int, str]] = []
 
         for talent_id in talent_ids_chunk:
-            talent_record = get_talent_record(conn, talent_id)
+            talent_record = _load_talent_record(conn, talent_id)
             if not talent_record:
                 continue
 
@@ -1270,9 +1355,10 @@ def debug_match(conn: sqlite3.Connection, talent_id: int, project_id: int) -> No
     :param project_id: 案件ID。
     :return: なし。
     """
-    talent = get_talent_record(conn, talent_id)
-    project = get_project_record(conn, project_id)
-    
+    talent = _load_talent_record(conn, talent_id)
+    project_record = get_project_record(conn, project_id)
+    project = ground_record(project_record, PROJECT_TECH_FIELDS, _load_skill_aliases()) if project_record else {}
+
     if not talent or not project:
         print(f"Error: Talent ID {talent_id} or Project ID {project_id} not found")
         return
