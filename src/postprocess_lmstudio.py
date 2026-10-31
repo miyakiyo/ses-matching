@@ -1908,12 +1908,13 @@ def process_pending_records_with_lmstudio(
                             _truncate_for_log(json_text),
                         )
                         save_status = "1"
-                        # 件名による振り分けと、LLM が本文から判定した分類が逆の場合は、
-                        # 振り分け誤り（人材メールが案件に入る等）とみなしてマッチング対象外にする。
+                        # 案件の表で LLM が本文から「人材」と判定した場合は、振り分け誤り
+                        # （人材の紹介メールが案件に入る）とみなしてマッチング対象外にする。
+                        # 人材の表では、LLM が本物の人材メールを「案件」と誤判定することが多く
+                        # （実データで約半数）、人材を取りこぼすため適用しない。
                         # 「その他」は判定があいまいなため対象外にしない。
                         llm_category = str(first_obj.get("分類") or "").strip()
-                        opposite_category = "人材" if category == "案件" else "案件"
-                        if llm_category == opposite_category:
+                        if category == "案件" and llm_category == "人材":
                             save_status = "5"
                             logger.info(
                                 "LM分類が件名の振り分けと逆のため status=5 を付与: table=%s, id=%s, llm_category=%s",

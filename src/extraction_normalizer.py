@@ -161,6 +161,130 @@ def parse_age_text(value: Any) -> Tuple[Optional[int], Optional[int]]:
     return (low, high)
 
 
+# 「即~」「随時」「確定後1週間～」「決まり次第」も、すぐ開始できる意味として受信月にする
+_IMMEDIATE_PATTERN = re.compile(r"即日|即時|即参画|即稼働|即\s*[~〜～-]|asap|すぐ|今月|随時|確定後|決まり次第|決定後")
+_NEXT_MONTH_PATTERN = re.compile(r"来月|翌月")
+_YEAR_MONTH_PATTERN = re.compile(r"(\d{4})\s*(?:年|/|-|\.)\s*(\d{1,2})(?:\s*月)?")
+_MONTH_PATTERN = re.compile(r"(?<!\d)(\d{1,2})\s*(?:月|/\s*\d{1,2})")
+# 「2026年12月～2027年1月」の 1月 のように、期間の終わりの月は開始月に含めない
+_RANGE_END_PREFIX = re.compile(rf"{_RANGE_SEPARATORS}\s*(?:\d{{4}}\s*年)?\s*$")
+# 受信月より前の月が書かれていたら翌年とみなす（10月受信の「1月～」は翌年1月）。
+# 直前の月（受信の前月）は、書き手が受信日をまたいだだけとみなして同じ年にする
+_PAST_MONTH_TOLERANCE = 1
+MONTHS_PER_YEAR = 12
+
+
+def _parse_received_month(received_at: Any) -> Optional[Tuple[int, int]]:
+    """受信日時（"2026-10-27T00:03:23Z" など）から (年, 月) を取り出します。"""
+    match = re.match(r"(\d{4})-(\d{2})", str(received_at or ""))
+    if not match:
+        return None
+    return (int(match.group(1)), int(match.group(2)))
+
+
+def _add_months(year: int, month: int, months: int) -> Tuple[int, int]:
+    """(年, 月) に月数を足します。"""
+    index = year * MONTHS_PER_YEAR + (month - 1) + months
+    return (index // MONTHS_PER_YEAR, index % MONTHS_PER_YEAR + 1)
+
+
+def _infer_year(month: int, received: Optional[Tuple[int, int]]) -> Optional[Tuple[int, int]]:
+    """年の書かれていない月に、受信日から年を補います。受信日が無ければ判断できないため None。"""
+    if received is None:
+        return None
+    year, received_month = received
+    if month < received_month - _PAST_MONTH_TOLERANCE:
+        year += 1
+    return (year, month)
+
+
+def parse_start_months(value: Any, received_at: Any) -> list[str]:
+    """開始時期の原文から、開始できる月を "YYYY-MM" の一覧で返します。
+
+    「即日」「今月」は受信月、「来月」は受信月の翌月とする。
+    「即日 or 11月～」のように複数書かれていれば、すべてを開始できる月とする。
+    「2026年12月～2027年1月」の終わりの月のように、期間の終わりは含めない。
+
+    :param value: 案件の「時期」または人材の「稼働可能日」の原文。
+    :param received_at: メールの受信日時（年の補完と「即日」の解釈に使う）。
+    :return: 開始できる月の一覧（昇順）。読み取れなければ空。
+    """
+    text = _normalize_text(value).lower()
+    if not text:
+        return []
+    received = _parse_received_month(received_at)
+    months: set[Tuple[int, int]] = set()
+
+    if received is not None and _IMMEDIATE_PATTERN.search(text):
+        months.add(received)
+    if received is not None and _NEXT_MONTH_PATTERN.search(text):
+        months.add(_add_months(*received, 1))
+
+    consumed: list[Tuple[int, int]] = []
+    for match in _YEAR_MONTH_PATTERN.finditer(text):
+        consumed.append(match.span())
+        month = int(match.group(2))
+        if not 1 <= month <= MONTHS_PER_YEAR or _RANGE_END_PREFIX.search(text[:match.start()]):
+            continue
+        months.add((int(match.group(1)), month))
+    for match in _MONTH_PATTERN.finditer(text):
+        if any(start <= match.start() < end for start, end in consumed):
+            continue
+        month = int(match.group(1))
+        if not 1 <= month <= MONTHS_PER_YEAR or _RANGE_END_PREFIX.search(text[:match.start()]):
+            continue
+        inferred = _infer_year(month, received)
+        if inferred is not None:
+            months.add(inferred)
+
+    return [f"{year:04d}-{month:02d}" for year, month in sorted(months)]
+
+
+REGION_KANTO = "kanto"
+REGION_OTHER = "other"
+
+# 関東を示す語。駅名だけの記載が多く、関東の駅をすべて列挙はできないため、明示的な語だけを見る
+_KANTO_PATTERN = re.compile(r"東京|都内|23区|神奈川|横浜|川崎|埼玉|さいたま|大宮|千葉|茨城|栃木|群馬|関東|首都圏")
+# 関東以外を示す語（都道府県・主要都市・主要駅・地方名）。
+# 名字と紛らわしい語（山口・宮崎・松本・福井・香川・富山・梅田など）は「県」「市」「駅」付きでだけ見る。
+# 「東京都」の「京都」、「東北沢」の「東北」、「東海道線」の「東海」を拾わないよう、地方名は「地方」付きにする。
+# 「浜松町」（東京）は浜松に含めない。「名駅」は「海老名駅」に当たるため使わない。
+_OTHER_REGION_PATTERN = re.compile(
+    r"北海道|札幌|青森|岩手|盛岡|宮城県|仙台|秋田|山形|福島県|郡山|いわき|新潟|富山県|石川県|金沢|福井県"
+    r"|山梨|甲府|長野県|松本市|岐阜|静岡|浜松(?!町)|愛知|名古屋|刈谷|豊田市|三重|四日市|滋賀|(?<!東)京都"
+    r"|大阪|梅田駅|難波|なんば|心斎橋|淀屋橋|兵庫|神戸|三宮|三ノ宮|姫路|奈良県|和歌山|鳥取|島根|岡山|広島"
+    r"|山口県|徳島|香川県|高松市|愛媛|松山市|高知|福岡|博多|天神駅|北九州|佐賀|長崎|熊本|大分|宮崎県|鹿児島"
+    r"|沖縄|那覇|九州|関西|東海地方|北陸|東北地方|四国"
+)
+# 「九州出張あり」「名古屋出張有り」「遠隔地からの参画も可」のような、勤務地そのものではない記載は見ない
+_REGION_IGNORED_CLAUSE = re.compile(r"出張|遠隔地|地方可|全国")
+_REGION_CLAUSE_SEPARATORS = re.compile(r"[、。,\n()（）※/／]")
+
+
+def classify_region(*values: Any) -> Optional[str]:
+    """最寄駅・作業場所・件名などから、関東か関東以外かを判定します。
+
+    関東を示す語があれば関東、なければ関東以外を示す語があれば関東以外とする。
+    どちらも無ければ None（駅名だけの記載が多く、判断できない）。
+
+    :param values: 判定に使う文字列（最寄駅・作業場所・件名など）。
+    :return: REGION_KANTO / REGION_OTHER / None。
+    """
+    clauses = []
+    for value in values:
+        text = _normalize_text(value)
+        clauses.extend(
+            clause for clause in _REGION_CLAUSE_SEPARATORS.split(text)
+            if clause and not _REGION_IGNORED_CLAUSE.search(clause)
+        )
+    text = "\n".join(clauses)
+    if _KANTO_PATTERN.search(text):
+        return REGION_KANTO
+    if _OTHER_REGION_PATTERN.search(text):
+        return REGION_OTHER
+    return None
+
+
 def _format_number(value: Optional[float]) -> Optional[str]:
     """数値をDB保存用の文字列にします（60.0 は "60"）。"""
     if value is None:

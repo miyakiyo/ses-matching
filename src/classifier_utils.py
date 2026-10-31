@@ -3,6 +3,25 @@ from typing import List
 from pathlib import Path
 
 
+# 人材キーワード（要員・人材）を含むが、人を募集している案件メールの言い回し。
+# 人材キーワードより優先して案件とする（例:「上流NW要員募集」「C言語経験者募集」「貴社要員様まで」）。
+# 人材側の「案件募集してます」「案件探してます」は含めない。
+PROJECT_PRIORITY_PHRASES = (
+    "要員募集",
+    "要員を募集",
+    "要員探して",
+    "要員を探して",
+    "人材募集",
+    "人材を募集",
+    "要員様まで",
+    "経験者募集",
+    "方を募集",
+    "方募集",
+    "方探して",
+    "方を探して",
+)
+
+
 def classify_ses_subject(subject: str, project_keywords: List[str], talent_keywords: List[str]) -> str:
     """件名キーワードでSESメールを分類します。
 
@@ -13,6 +32,8 @@ def classify_ses_subject(subject: str, project_keywords: List[str], talent_keywo
     """
     # 大文字小文字の揺れを吸収して判定する。
     normalized = (subject or "").lower()
+    if any(phrase in normalized for phrase in PROJECT_PRIORITY_PHRASES):
+        return "案件"
     # 各キーワードが件名に含まれるかをそれぞれ判定する。
     project_hit = any(k and k.lower() in normalized for k in project_keywords)
     talent_hit = any(k and k.lower() in normalized for k in talent_keywords)
