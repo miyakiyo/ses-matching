@@ -5,6 +5,9 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.matching_engine import (  # noqa: E402
+    REASON_FORMAT_COMPACT,
+    REASON_FORMAT_FULL,
+    _collect_match_rows_for_talent,
     _normalize_price_man,
     _normalize_remote,
     _match_skills,
@@ -12,6 +15,7 @@ from src.matching_engine import (  # noqa: E402
     _parse_project_price_range,
     _parse_talent_price_range,
     calculate_match_score,
+    compact_reason,
 )
 
 
@@ -417,6 +421,68 @@ class ConstraintTest(unittest.TestCase):
     def test_unknown_constraints_pass(self):
         score, _ = calculate_match_score(talent(外国籍=None), project(外国籍可否="false"))
         self.assertGreater(score, 0)
+
+
+class CompactReasonTest(unittest.TestCase):
+    def test_all_items_matched(self):
+        _, reason = calculate_match_score(*full_match_pair())
+        self.assertEqual(
+            compact_reason(reason),
+            {
+                "v": 2,
+                "skills": [50, "ok"],
+                "salary": [25, "ok"],
+                "role": [10, "ok"],
+                "phase": [10, "ok"],
+                "constraints": [25, "ok"],
+                "age": [15, "ok"],
+                "remote": [15, "ok"],
+                "start": [15, "ok"],
+                "location": [15, "ok"],
+            },
+        )
+
+    def test_unknown_items_are_distinguished_from_mismatch(self):
+        _, reason = calculate_match_score(
+            *full_match_pair(希望単価=None, 担当=None, 年齢=None, リモート頻度=None, 稼働可能日=None)
+        )
+        compact = compact_reason(reason)
+        self.assertEqual(compact["salary"], [0, "unknown"])
+        self.assertEqual(compact["role"], [0, "unknown"])
+        self.assertEqual(compact["age"], [0, "unknown"])
+        self.assertEqual(compact["remote"], [0, "unknown"])
+        self.assertEqual(compact["start"], [0, "unknown"])
+
+    def test_mismatched_items_are_ng(self):
+        _, reason = calculate_match_score(
+            *full_match_pair(希望単価="40", 担当='["PM"]', リモート頻度="週1出社", 稼働可能日="1月～")
+        )
+        compact = compact_reason(reason)
+        self.assertEqual(compact["salary"], [0, "ng"])
+        self.assertEqual(compact["role"], [0, "ng"])
+        self.assertEqual(compact["remote"], [0, "ng"])
+        self.assertEqual(compact["start"], [0, "ng"])
+
+    def test_collect_rows_saves_compact_reason(self):
+        t, p = full_match_pair()
+        stats = _collect_match_rows_for_talent(1, t, [(2, p)], save_reason_in_db=True, reason_format=REASON_FORMAT_COMPACT)
+        self.assertEqual(len(stats["rows"]), 1)
+        talent_id, project_id, score, reason = stats["rows"][0]
+        self.assertEqual((talent_id, project_id, score), (1, 2, 100))
+        self.assertEqual(reason["v"], 2)
+        self.assertEqual(reason["skills"], [50, "ok"])
+
+    def test_collect_rows_saves_full_reason(self):
+        t, p = full_match_pair()
+        stats = _collect_match_rows_for_talent(1, t, [(2, p)], save_reason_in_db=True, reason_format=REASON_FORMAT_FULL)
+        reason = stats["rows"][0][3]
+        self.assertNotIn("v", reason)
+        self.assertEqual(reason["skills"]["score"], 50)
+
+    def test_collect_rows_saves_no_reason_when_disabled(self):
+        t, p = full_match_pair()
+        stats = _collect_match_rows_for_talent(1, t, [(2, p)], save_reason_in_db=False, reason_format=REASON_FORMAT_COMPACT)
+        self.assertIsNone(stats["rows"][0][3])
 
 
 if __name__ == "__main__":

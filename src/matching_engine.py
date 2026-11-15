@@ -42,6 +42,16 @@ RAW_SCORE_MAX = 180
 START_SCORE = 15
 LOCATION_SCORE = 15
 
+# matches.reason に保存する形式。full は詳細理由の全文、compact は項目ごとの [点数, 判定] だけ。
+REASON_FORMAT_FULL = "full"
+REASON_FORMAT_COMPACT = "compact"
+REASON_FORMATS = (REASON_FORMAT_FULL, REASON_FORMAT_COMPACT)
+# compact 形式の版番号（reason["v"]）。全文形式には "v" が無いため、これで見分ける。
+REASON_COMPACT_VERSION = 2
+REASON_VERDICT_OK = "ok"
+REASON_VERDICT_NG = "ng"
+REASON_VERDICT_UNKNOWN = "unknown"
+
 DEFAULT_MATCHING_CHUNK_SIZE = 50
 DEFAULT_TALENT_LOG_INTERVAL = 100
 
@@ -1001,6 +1011,87 @@ def calculate_match_score(talent_record: dict, project_record: dict) -> Tuple[in
     return (total_score, reason)
 
 
+def _verdict(match: object) -> str:
+    """一致判定（True / False）を、点数だけの reason の判定文字列にします。"""
+    if match is True:
+        return REASON_VERDICT_OK
+    if match is False:
+        return REASON_VERDICT_NG
+    return REASON_VERDICT_UNKNOWN
+
+
+def _verdict_by_status(section: dict) -> str:
+    """details.status を持つ項目（勤務形態・開始時期・勤務地）の判定文字列を返します。
+
+    情報不足で判定していない項目は match が True のため、status で「不明」と区別します。
+    """
+    status = (section.get("details") or {}).get("status")
+    if status == "unknown":
+        return REASON_VERDICT_UNKNOWN
+    if status == "not_matched":
+        return REASON_VERDICT_NG
+    return _verdict(section.get("match"))
+
+
+def _compact_list_item(entry: dict) -> list:
+    """担当・工程の1項目を [点数, 判定] にします（一致で 10 点、不一致・不明は 0 点）。"""
+    status = entry.get("status")
+    if status == "matched":
+        return [10, REASON_VERDICT_OK]
+    if status == "not_matched":
+        return [0, REASON_VERDICT_NG]
+    return [0, REASON_VERDICT_UNKNOWN]
+
+
+def _salary_verdict(section: dict) -> str:
+    """単価の判定文字列を返します（単価が不明な場合は match が True でも「不明」）。"""
+    if (section.get("details") or {}).get("status") == "unknown_price":
+        return REASON_VERDICT_UNKNOWN
+    return _verdict(section.get("match"))
+
+
+def _age_verdict(section: dict) -> str:
+    """年齢の判定文字列を返します（年齢が不明・範囲が不正な場合は「不明」）。"""
+    details = section.get("details") or {}
+    if details.get("status") == "no_limit":
+        return REASON_VERDICT_OK
+    within_limit = details.get("within_limit")
+    if isinstance(within_limit, bool):
+        return _verdict(within_limit)
+    return REASON_VERDICT_UNKNOWN
+
+
+def compact_reason(reason: dict) -> dict:
+    """詳細理由（calculate_match_score の reason）を、項目ごとの [点数, 判定] だけにします。
+
+    matches.reason に保存するサイズを抑えるための形式です（1件あたり約 190 バイト）。
+    判定は "ok"（一致）/ "ng"（不一致）/ "unknown"（情報不足で判定していない）のいずれかです。
+    担当・工程は role_phase をまとめず、role / phase の別項目にします。
+
+    例: {"v": 2, "skills": [30, "ok"], "salary": [0, "unknown"], "role": [0, "unknown"], ...}
+
+    :param reason: calculate_match_score が返す詳細理由。
+    :return: 点数だけの理由。"v" は形式の版番号（REASON_COMPACT_VERSION）。
+    """
+    result: dict = {"v": REASON_COMPACT_VERSION}
+    if "skills" in reason:
+        result["skills"] = [reason["skills"]["score"], _verdict(reason["skills"]["match"])]
+    if "salary" in reason:
+        result["salary"] = [reason["salary"]["score"], _salary_verdict(reason["salary"])]
+    if "role_phase" in reason:
+        role_phase_details = reason["role_phase"]["details"]
+        result["role"] = _compact_list_item(role_phase_details.get("role") or {})
+        result["phase"] = _compact_list_item(role_phase_details.get("phase") or {})
+    if "constraints" in reason:
+        result["constraints"] = [reason["constraints"]["score"], _verdict(reason["constraints"]["match"])]
+    if "age" in reason:
+        result["age"] = [reason["age"]["score"], _age_verdict(reason["age"])]
+    for key in ("remote", "start", "location"):
+        if key in reason:
+            result[key] = [reason[key]["score"], _verdict_by_status(reason[key])]
+    return result
+
+
 def _is_same_sender(talent_record: dict, project_record: dict) -> bool:
     """folder または sender_addr が一致する場合に同一送信者とみなします。"""
     talent_folder = str(talent_record.get("folder") or "").strip().lower()
@@ -1055,6 +1146,7 @@ def _collect_match_rows_for_talent(
     talent_record: dict,
     project_records: list[tuple[int, dict]],
     save_reason_in_db: bool,
+    reason_format: str,
 ) -> dict:
     """1人材に対する案件評価結果を集約します。"""
     total_matches = 0
@@ -1081,6 +1173,8 @@ def _collect_match_rows_for_talent(
 
         if not save_reason_in_db:
             reason = None
+        elif reason_format == REASON_FORMAT_COMPACT:
+            reason = compact_reason(reason)
 
         pending_match_rows.append((talent_id, project_id, score, reason))
 
@@ -1105,6 +1199,7 @@ def _compute_matches_sequential(
     project_ids: list[int],
     talent_log_interval: int,
     save_reason_in_db: bool,
+    reason_format: str,
 ) -> dict:
     """逐次でマッチング候補を計算します。"""
     project_records = _load_project_records(conn, project_ids)
@@ -1127,6 +1222,7 @@ def _compute_matches_sequential(
             talent_record,
             project_records,
             save_reason_in_db=save_reason_in_db,
+            reason_format=reason_format,
         )
         pending_match_rows.extend(talent_stats["rows"])
         total_matches += int(talent_stats["total_matches"])
@@ -1155,6 +1251,7 @@ def _compute_matches_worker(
     talent_ids_chunk: list[int],
     project_ids: list[int],
     save_reason_in_db: bool,
+    reason_format: str,
 ) -> dict:
     """子プロセスで人材チャンクのマッチング候補を計算します。"""
     conn = sqlite3.connect(db_path)
@@ -1177,6 +1274,7 @@ def _compute_matches_worker(
                 talent_record,
                 project_records,
                 save_reason_in_db=save_reason_in_db,
+                reason_format=reason_format,
             )
             pending_match_rows.extend(talent_stats["rows"])
             total_matches += int(talent_stats["total_matches"])
@@ -1216,6 +1314,7 @@ def _compute_matches_parallel(
     chunk_size: int,
     talent_log_interval: int,
     save_reason_in_db: bool,
+    reason_format: str,
 ) -> dict:
     """マルチプロセスでマッチング候補を計算します。"""
     talent_chunks = _chunk_values(sorted(talent_ids), chunk_size)
@@ -1228,6 +1327,7 @@ def _compute_matches_parallel(
                 project_ids,
                 talent_log_interval=talent_log_interval,
                 save_reason_in_db=save_reason_in_db,
+                reason_format=reason_format,
             )
         finally:
             conn.close()
@@ -1248,6 +1348,7 @@ def _compute_matches_parallel(
                 talent_chunk,
                 project_ids,
                 save_reason_in_db,
+                reason_format,
             )
             for talent_chunk in talent_chunks
         ]
@@ -1280,6 +1381,7 @@ def process_all_matches(
     conn: sqlite3.Connection,
     use_multiprocessing: bool = False,
     save_reason_in_db: bool = True,
+    reason_format: str = REASON_FORMAT_FULL,
     num_workers: int = 1,
     chunk_size: int = DEFAULT_MATCHING_CHUNK_SIZE,
     talent_log_interval: int = DEFAULT_TALENT_LOG_INTERVAL,
@@ -1315,6 +1417,7 @@ def process_all_matches(
             chunk_size=chunk_size,
             talent_log_interval=talent_log_interval,
             save_reason_in_db=save_reason_in_db,
+            reason_format=reason_format,
         )
     else:
         match_stats = _compute_matches_sequential(
@@ -1323,6 +1426,7 @@ def process_all_matches(
             project_ids,
             talent_log_interval=talent_log_interval,
             save_reason_in_db=save_reason_in_db,
+            reason_format=reason_format,
         )
 
     matches_added = add_matches_bulk(conn, match_stats["rows"])

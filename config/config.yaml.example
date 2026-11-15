@@ -44,6 +44,7 @@ delete_old:
 matching:
   multiprocess_enabled: false  # true の場合、案件評価ループをマルチプロセスで並列実行
   save_reason_in_db: true  # false の場合、matches.reason は保存せず NULL を保存
+  reason_format: full  # full: 詳細理由の全文 / compact: 項目ごとの [点数, 判定] だけ（サイズ約1/7。コピー先DBにも reason を残す）
   num_workers: 4  # 並列ワーカー数。1 の場合は逐次実行
   chunk_size: 50  # 1タスクあたりの人材件数
   talent_log_interval: 100  # talent_id 完了ログの出力間隔（処理件数ベース）

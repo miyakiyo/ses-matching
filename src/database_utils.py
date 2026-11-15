@@ -885,7 +885,8 @@ def add_matches_bulk(
 
         serialized_reason = None
         if reason is not None:
-            serialized_reason = json.dumps(reason, ensure_ascii=False)
+            # 件数が多いため、区切りの空白を入れずに保存サイズを抑える
+            serialized_reason = json.dumps(reason, ensure_ascii=False, separators=(",", ":"))
 
         params.append(
             (

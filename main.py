@@ -417,8 +417,30 @@ def _run_delete_old_records(conn) -> tuple[int, int, int, int]:
     return deleted_talent, deleted_project, deleted_matches, deleted_history
 
 
+def _get_matching_reason_format() -> str:
+    """config.matching.reason_format（matches.reason の保存形式）を返します。未指定・不正な値は full。"""
+    from src.matching_engine import REASON_FORMAT_FULL, REASON_FORMATS
+
+    reason_format = config.get('matching', {}).get('reason_format', REASON_FORMAT_FULL)
+    if reason_format not in REASON_FORMATS:
+        logger.warning(
+            f'config.matching.reason_format は {" / ".join(REASON_FORMATS)} を指定してください。'
+            f'default={REASON_FORMAT_FULL} を使用します。'
+        )
+        return REASON_FORMAT_FULL
+    return reason_format
+
+
 def _strip_matches_reason_for_copied_db(db_path: Path) -> None:
-    """コピー先DBのmatches.reasonをNULL化してサイズ削減を試みます。"""
+    """コピー先DBのmatches.reasonをNULL化してサイズ削減を試みます。
+
+    reason を点数だけの形式（compact）で保存している場合は、コピー先でも理由を表示できるよう残します。
+    """
+    from src.matching_engine import REASON_FORMAT_COMPACT
+
+    if _get_matching_reason_format() == REASON_FORMAT_COMPACT:
+        logger.info(f'reason_format=compact のため、コピー先DBのmatches.reasonを残します: {db_path}')
+        return
     try:
         with sqlite3.connect(str(db_path)) as conn:
             cur = conn.cursor()
@@ -601,6 +623,7 @@ def _run_matching_only(conn) -> dict[str, int]:
     if not isinstance(matching_save_reason_in_db, bool):
         logger.warning('config.matching.save_reason_in_db は bool を指定してください。default=true を使用します。')
         matching_save_reason_in_db = True
+    matching_reason_format = _get_matching_reason_format()
     matching_num_workers = max(1, int(matching_config.get('num_workers', 1)))
     matching_chunk_size = max(1, int(matching_config.get('chunk_size', 50)))
     matching_talent_log_interval = max(1, int(matching_config.get('talent_log_interval', 100)))
@@ -625,6 +648,7 @@ def _run_matching_only(conn) -> dict[str, int]:
             conn,
             use_multiprocessing=matching_multiprocess_enabled,
             save_reason_in_db=matching_save_reason_in_db,
+            reason_format=matching_reason_format,
             num_workers=matching_num_workers,
             chunk_size=matching_chunk_size,
             talent_log_interval=matching_talent_log_interval,
